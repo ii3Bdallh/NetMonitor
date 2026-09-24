@@ -21,6 +21,7 @@
 #define PROC_NET_DEV "/proc/net/dev"
 #define BUFFER_SIZE 512
 #define BATCH_INTERVAL_SECONDS 60
+#define MAX_TRACKED_APPS 256
 
 static volatile bool keep_running = true;
 static bool is_daemon_mode = false;
@@ -48,18 +49,13 @@ void log_message(int priority, const char *format, ...) {
     va_end(args);
 }
 
-// ==========================================
-// Path Resolution (Global Fixed Location)
-// ==========================================
 void get_database_path(char *dest, size_t maxlen, bool for_writing) {
-    // 1. Primary global system location: /var/lib/netmon/usage.db
     if (access(SYSTEM_DB_FILE, R_OK) == 0) {
         snprintf(dest, maxlen, "%s", SYSTEM_DB_FILE);
         return;
     }
 
     if (for_writing) {
-        // Create directory if running as root
         if (mkdir(SYSTEM_DB_DIR, 0777) == 0 || errno == EEXIST || access(SYSTEM_DB_DIR, W_OK) == 0) {
             chmod(SYSTEM_DB_DIR, 0777);
             snprintf(dest, maxlen, "%s", SYSTEM_DB_FILE);
@@ -67,7 +63,6 @@ void get_database_path(char *dest, size_t maxlen, bool for_writing) {
         }
     }
 
-    // 2. User directory fallback: ~/.local/share/netmon/usage.db
     const char *home = getenv("HOME");
     if (home) {
         char user_dir[256];
@@ -89,13 +84,9 @@ void get_database_path(char *dest, size_t maxlen, bool for_writing) {
         }
     }
 
-    // Default to system DB path
     snprintf(dest, maxlen, "%s", SYSTEM_DB_FILE);
 }
 
-// ==========================================
-// Daemonization Process
-// ==========================================
 void daemonize(void) {
     pid_t pid = fork();
     if (pid < 0) {
@@ -151,7 +142,6 @@ bool init_database(Database *database, bool for_writing) {
     int rc = sqlite3_open_v2(database->db_path, &database->db, open_flags, NULL);
 
     if (rc != SQLITE_OK) {
-        // If read-only open failed, try regular open
         rc = sqlite3_open(database->db_path, &database->db);
     }
 
@@ -160,7 +150,6 @@ bool init_database(Database *database, bool for_writing) {
         return false;
     }
 
-    // If writing, configure WAL mode and schema
     if (for_writing) {
         sqlite3_exec(database->db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
         sqlite3_exec(database->db, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
@@ -197,7 +186,6 @@ bool init_database(Database *database, bool for_writing) {
             return false;
         }
 
-        // Grant read permissions to database files so all users can query
         chmod(database->db_path, 0666);
     }
 
@@ -277,16 +265,10 @@ bool get_active_interface_stats(NetInterface *iface) {
     return found;
 }
 
-typedef enum {
-    PROTO_TCP,
-    PROTO_UDP
-} SocketProto;
-
 typedef struct {
     unsigned long inode;
-    unsigned long tx_queue;
-    unsigned long rx_queue;
-    SocketProto proto;
+    bool is_established; // State 01 = ESTABLISHED
+    bool is_remote;      // Not localhost
     pid_t pid;
     char comm[64];
 } SocketEntry;
@@ -303,7 +285,7 @@ void init_socket_list(SocketList *list) {
     list->entries = malloc(list->capacity * sizeof(SocketEntry));
 }
 
-void add_socket(SocketList *list, unsigned long inode, unsigned long tx_q, unsigned long rx_q, SocketProto proto) {
+void add_socket(SocketList *list, unsigned long inode, bool is_est, bool is_remote) {
     if (!list->entries) return;
 
     if (list->count >= list->capacity) {
@@ -315,9 +297,8 @@ void add_socket(SocketList *list, unsigned long inode, unsigned long tx_q, unsig
     }
 
     list->entries[list->count].inode = inode;
-    list->entries[list->count].tx_queue = tx_q;
-    list->entries[list->count].rx_queue = rx_q;
-    list->entries[list->count].proto = proto;
+    list->entries[list->count].is_established = is_est;
+    list->entries[list->count].is_remote = is_remote;
     list->entries[list->count].pid = 0;
     list->entries[list->count].comm[0] = '\0';
     list->count++;
@@ -332,7 +313,7 @@ void free_socket_list(SocketList *list) {
     list->capacity = 0;
 }
 
-void parse_proc_net_file(const char *path, SocketProto proto, SocketList *list) {
+void parse_proc_net_file(const char *path, SocketList *list) {
     FILE *f = fopen(path, "r");
     if (!f) return;
 
@@ -343,9 +324,10 @@ void parse_proc_net_file(const char *path, SocketProto proto, SocketList *list) 
     }
 
     while (fgets(line, sizeof(line), f)) {
-        unsigned long tx_q = 0, rx_q = 0, inode = 0;
+        unsigned long inode = 0;
         char local_addr[128], rem_addr[128];
         unsigned int state = 0;
+        unsigned long tx_q = 0, rx_q = 0;
         int dummy_d1 = 0, dummy_d2 = 0;
         unsigned long dummy_ul1 = 0, dummy_ul2 = 0, dummy_ul3 = 0;
 
@@ -356,7 +338,10 @@ void parse_proc_net_file(const char *path, SocketProto proto, SocketList *list) 
                &dummy_d1, &dummy_d2, &inode);
 
         if (num_matched >= 11 && inode > 0) {
-            add_socket(list, inode, tx_q, rx_q, proto);
+            // Check if remote address is not 00000000:0000 and not 127.0.0.1 (0100007F)
+            bool is_remote = (strncmp(rem_addr, "00000000", 8) != 0 && strncmp(rem_addr, "0100007F", 8) != 0);
+            bool is_est = (state == 1); // 01 = ESTABLISHED
+            add_socket(list, inode, is_est, is_remote);
         }
     }
 
@@ -438,72 +423,124 @@ void scan_proc_fds(SocketList *list) {
     closedir(proc_dir);
 }
 
+// ==========================================
+// In-Memory Bandwidth Accumulator
+// ==========================================
 typedef struct {
-    pid_t pid;
-    char comm[64];
-    int tcp_sockets;
-    int udp_sockets;
-    unsigned long long total_rx_queue;
-    unsigned long long total_tx_queue;
-} ProcessNetUsage;
+    char app_name[64];
+    unsigned long long accumulated_tx;
+    unsigned long long accumulated_rx;
+    int active_weight;
+} AppBandwidth;
 
-int aggregate_process_usage(const SocketList *list, ProcessNetUsage *procs, size_t max_procs) {
-    size_t proc_count = 0;
+typedef struct {
+    AppBandwidth apps[MAX_TRACKED_APPS];
+    size_t count;
+} BandwidthTracker;
 
-    for (size_t i = 0; i < list->count; i++) {
-        if (list->entries[i].pid <= 0) continue;
-
-        pid_t pid = list->entries[i].pid;
-        int found_idx = -1;
-
-        for (size_t j = 0; j < proc_count; j++) {
-            if (procs[j].pid == pid) {
-                found_idx = (int)j;
-                break;
-            }
-        }
-
-        if (found_idx == -1 && proc_count < max_procs) {
-            found_idx = (int)proc_count;
-            procs[found_idx].pid = pid;
-            snprintf(procs[found_idx].comm, sizeof(procs[found_idx].comm), "%s", list->entries[i].comm);
-            procs[found_idx].tcp_sockets = 0;
-            procs[found_idx].udp_sockets = 0;
-            procs[found_idx].total_rx_queue = 0;
-            procs[found_idx].total_tx_queue = 0;
-            proc_count++;
-        }
-
-        if (found_idx != -1) {
-            if (list->entries[i].proto == PROTO_TCP) {
-                procs[found_idx].tcp_sockets++;
-            } else {
-                procs[found_idx].udp_sockets++;
-            }
-            procs[found_idx].total_rx_queue += list->entries[i].rx_queue;
-            procs[found_idx].total_tx_queue += list->entries[i].tx_queue;
-        }
-    }
-
-    return (int)proc_count;
+void init_tracker(BandwidthTracker *tracker) {
+    tracker->count = 0;
+    memset(tracker->apps, 0, sizeof(tracker->apps));
 }
 
-bool batch_insert_usage(Database *database, const ProcessNetUsage *procs, size_t count) {
-    if (!database->db || !database->insert_stmt || count == 0) {
-        return false;
+AppBandwidth* get_or_create_app(BandwidthTracker *tracker, const char *name) {
+    for (size_t i = 0; i < tracker->count; i++) {
+        if (strcmp(tracker->apps[i].app_name, name) == 0) {
+            return &tracker->apps[i];
+        }
     }
+    if (tracker->count < MAX_TRACKED_APPS) {
+        size_t idx = tracker->count++;
+        snprintf(tracker->apps[idx].app_name, sizeof(tracker->apps[idx].app_name), "%s", name);
+        tracker->apps[idx].accumulated_tx = 0;
+        tracker->apps[idx].accumulated_rx = 0;
+        tracker->apps[idx].active_weight = 0;
+        return &tracker->apps[idx];
+    }
+    return NULL;
+}
+
+// Distribute measured delta network interface bytes to currently active connected apps
+void track_traffic_sample(BandwidthTracker *tracker, const SocketList *list, unsigned long long delta_rx, unsigned long long delta_tx) {
+    if (delta_rx == 0 && delta_tx == 0) return;
+
+    // Reset current active weights
+    for (size_t i = 0; i < tracker->count; i++) {
+        tracker->apps[i].active_weight = 0;
+    }
+
+    int total_weight = 0;
+
+    for (size_t i = 0; i < list->count; i++) {
+        if (list->entries[i].pid <= 0 || strlen(list->entries[i].comm) == 0) continue;
+
+        // Give high priority to ESTABLISHED remote internet sockets
+        int weight = 1;
+        if (list->entries[i].is_established && list->entries[i].is_remote) {
+            weight = 10;
+        } else if (list->entries[i].is_established) {
+            weight = 5;
+        } else if (list->entries[i].is_remote) {
+            weight = 3;
+        }
+
+        AppBandwidth *app = get_or_create_app(tracker, list->entries[i].comm);
+        if (app) {
+            app->active_weight += weight;
+            total_weight += weight;
+        }
+    }
+
+    if (total_weight > 0) {
+        for (size_t i = 0; i < tracker->count; i++) {
+            if (tracker->apps[i].active_weight > 0) {
+                unsigned long long share_rx = (delta_rx * tracker->apps[i].active_weight) / total_weight;
+                unsigned long long share_tx = (delta_tx * tracker->apps[i].active_weight) / total_weight;
+                tracker->apps[i].accumulated_rx += share_rx;
+                tracker->apps[i].accumulated_tx += share_tx;
+            }
+        }
+    } else {
+        // If traffic occurred during short-lived connection (e.g. fast curl), assign to system/network daemon
+        AppBandwidth *app = get_or_create_app(tracker, "system-traffic");
+        if (app) {
+            app->accumulated_rx += delta_rx;
+            app->accumulated_tx += delta_tx;
+        }
+    }
+}
+
+// Flush accumulated non-zero bandwidth into SQLite
+bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
+    if (!database->db || !database->insert_stmt) return false;
+
+    bool has_records = false;
+    for (size_t i = 0; i < tracker->count; i++) {
+        if (tracker->apps[i].accumulated_rx > 0 || tracker->apps[i].accumulated_tx > 0) {
+            has_records = true;
+            break;
+        }
+    }
+
+    if (!has_records) return false;
 
     sqlite3_exec(database->db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
 
-    for (size_t i = 0; i < count; i++) {
-        sqlite3_reset(database->insert_stmt);
-        sqlite3_clear_bindings(database->insert_stmt);
+    for (size_t i = 0; i < tracker->count; i++) {
+        if (tracker->apps[i].accumulated_rx > 0 || tracker->apps[i].accumulated_tx > 0) {
+            sqlite3_reset(database->insert_stmt);
+            sqlite3_clear_bindings(database->insert_stmt);
 
-        sqlite3_bind_text(database->insert_stmt, 1, procs[i].comm, -1, SQLITE_STATIC);
-        sqlite3_bind_int64(database->insert_stmt, 2, (sqlite3_int64)procs[i].total_tx_queue);
-        sqlite3_bind_int64(database->insert_stmt, 3, (sqlite3_int64)procs[i].total_rx_queue);
+            sqlite3_bind_text(database->insert_stmt, 1, tracker->apps[i].app_name, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(database->insert_stmt, 2, (sqlite3_int64)tracker->apps[i].accumulated_tx);
+            sqlite3_bind_int64(database->insert_stmt, 3, (sqlite3_int64)tracker->apps[i].accumulated_rx);
 
-        sqlite3_step(database->insert_stmt);
+            sqlite3_step(database->insert_stmt);
+
+            // Reset accumulator after committing
+            tracker->apps[i].accumulated_tx = 0;
+            tracker->apps[i].accumulated_rx = 0;
+        }
     }
 
     sqlite3_exec(database->db, "COMMIT;", NULL, NULL, NULL);
@@ -574,7 +611,6 @@ void print_help(const char *prog_name) {
     printf("  -s, --sort <asc|desc>       Sort results by total consumption (default: desc)\n\n");
     printf("Daemon & Execution Modes:\n");
     printf("  -D, --daemon                Run as background daemon service (logs to syslog)\n");
-    printf("      --record                Capture a live snapshot & record into database\n");
     printf("  -h, --help                  Display this help message and exit\n\n");
     printf("Examples:\n");
     printf("  %s --last-minute 30\n", prog_name);
@@ -684,60 +720,68 @@ void query_database(Database *database, const CliOptions *opts) {
     sqlite3_finalize(stmt);
 }
 
-void execute_collector(Database *db, bool daemon_mode) {
-    time_t last_batch_time = 0;
+// Continuous Background Daemon Collector
+void run_daemon_collector(Database *db) {
+    log_message(LOG_INFO, "NetMonitor continuous background collector started (DB: %s).", db->db_path);
 
-    log_message(LOG_INFO, "NetMonitor background collector started (DB: %s).", db->db_path);
+    BandwidthTracker tracker;
+    init_tracker(&tracker);
 
-    do {
-        NetInterface active_iface;
-        bool has_iface = get_active_interface_stats(&active_iface);
+    NetInterface prev_iface = {0};
+    bool has_prev = get_active_interface_stats(&prev_iface);
 
-        SocketList sock_list;
-        init_socket_list(&sock_list);
+    time_t last_flush_time = time(NULL);
 
-        parse_proc_net_file("/proc/net/tcp", PROTO_TCP, &sock_list);
-        parse_proc_net_file("/proc/net/tcp6", PROTO_TCP, &sock_list);
-        parse_proc_net_file("/proc/net/udp", PROTO_UDP, &sock_list);
-        parse_proc_net_file("/proc/net/udp6", PROTO_UDP, &sock_list);
+    while (keep_running) {
+        sleep(1);
 
-        scan_proc_fds(&sock_list);
+        NetInterface curr_iface = {0};
+        bool has_curr = get_active_interface_stats(&curr_iface);
 
-        ProcessNetUsage procs[512];
-        int proc_count = aggregate_process_usage(&sock_list, procs, 512);
+        if (has_prev && has_curr && strcmp(prev_iface.name, curr_iface.name) == 0) {
+            unsigned long long delta_rx = 0;
+            unsigned long long delta_tx = 0;
+
+            if (curr_iface.rx_bytes >= prev_iface.rx_bytes) {
+                delta_rx = curr_iface.rx_bytes - prev_iface.rx_bytes;
+            }
+            if (curr_iface.tx_bytes >= prev_iface.tx_bytes) {
+                delta_tx = curr_iface.tx_bytes - prev_iface.tx_bytes;
+            }
+
+            if (delta_rx > 0 || delta_tx > 0) {
+                SocketList sock_list;
+                init_socket_list(&sock_list);
+
+                parse_proc_net_file("/proc/net/tcp", &sock_list);
+                parse_proc_net_file("/proc/net/tcp6", &sock_list);
+                parse_proc_net_file("/proc/net/udp", &sock_list);
+                parse_proc_net_file("/proc/net/udp6", &sock_list);
+
+                scan_proc_fds(&sock_list);
+
+                track_traffic_sample(&tracker, &sock_list, delta_rx, delta_tx);
+
+                free_socket_list(&sock_list);
+            }
+        }
+
+        if (has_curr) {
+            prev_iface = curr_iface;
+            has_prev = true;
+        }
 
         time_t now = time(NULL);
-
-        if (!daemon_mode || (now - last_batch_time >= BATCH_INTERVAL_SECONDS)) {
-            if (batch_insert_usage(db, procs, proc_count)) {
-                last_batch_time = now;
-                if (daemon_mode) {
-                    log_message(LOG_INFO, "Saved batch with %d active process records to SQLite.", proc_count);
-                }
+        if (now - last_flush_time >= BATCH_INTERVAL_SECONDS) {
+            if (flush_tracker_to_db(db, &tracker)) {
+                log_message(LOG_INFO, "Committed periodic network consumption batch to SQLite.");
             }
+            last_flush_time = now;
         }
+    }
 
-        if (!daemon_mode) {
-            printf("=========================================================================\n");
-            printf("     Network Usage Monitor - Snapshot Recorded to DB                    \n");
-            printf("=========================================================================\n");
-            if (has_iface) {
-                double rx_mb = (double)active_iface.rx_bytes / (1024.0 * 1024.0);
-                double tx_mb = (double)active_iface.tx_bytes / (1024.0 * 1024.0);
-                printf(" Active Interface : %s\n", active_iface.name);
-                printf(" Total Download   : %8.2f MB\n", rx_mb);
-                printf(" Total Upload     : %8.2f MB\n", tx_mb);
-                printf(" Total Traffic    : %8.2f MB\n", rx_mb + tx_mb);
-            }
-            printf(" [DB Status] Saved %d active application records into %s\n\n", proc_count, db->db_path);
-            free_socket_list(&sock_list);
-            break;
-        }
-
-        free_socket_list(&sock_list);
-        sleep(1);
-    } while (keep_running);
-
+    // Flush any remaining traffic on shutdown
+    flush_tracker_to_db(db, &tracker);
     log_message(LOG_INFO, "NetMonitor background collector stopped gracefully.");
 }
 
@@ -786,24 +830,21 @@ int main(int argc, char *argv[]) {
         {"custom",      required_argument, 0, 'c'},
         {"min",         required_argument, 0, OPT_MIN_SIZE},
         {"sort",        required_argument, 0, 's'},
-        {"record",      no_argument,       0, 'r'},
         {"daemon",      no_argument,       0, 'D'},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
-    bool has_query_flags = false;
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "d::w::m::c:s:rDh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d::w::m::c:s:Dh", long_options, &option_index)) != -1) {
         switch (opt) {
             case OPT_LAST_MINUTE: {
                 int n = get_optional_numeric_arg(argc, argv);
                 opts.time_filter_active = true;
                 snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d minutes', 'localtime')", n);
                 snprintf(opts.time_description, sizeof(opts.time_description), "Last %d Minute(s)", n);
-                has_query_flags = true;
                 break;
             }
 
@@ -812,7 +853,6 @@ int main(int argc, char *argv[]) {
                 opts.time_filter_active = true;
                 snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d hours', 'localtime')", n);
                 snprintf(opts.time_description, sizeof(opts.time_description), "Last %d Hour(s)", n);
-                has_query_flags = true;
                 break;
             }
 
@@ -821,7 +861,6 @@ int main(int argc, char *argv[]) {
                 opts.time_filter_active = true;
                 snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d days', 'localtime')", n);
                 snprintf(opts.time_description, sizeof(opts.time_description), "Last %d Day(s)", n);
-                has_query_flags = true;
                 break;
             }
 
@@ -831,7 +870,6 @@ int main(int argc, char *argv[]) {
                 opts.time_filter_active = true;
                 snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d days', 'localtime')", days);
                 snprintf(opts.time_description, sizeof(opts.time_description), "Last %d Week(s) (%d Days)", n, days);
-                has_query_flags = true;
                 break;
             }
 
@@ -840,7 +878,6 @@ int main(int argc, char *argv[]) {
                 opts.time_filter_active = true;
                 snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d months', 'localtime')", n);
                 snprintf(opts.time_description, sizeof(opts.time_description), "Last %d Month(s)", n);
-                has_query_flags = true;
                 break;
             }
 
@@ -849,14 +886,12 @@ int main(int argc, char *argv[]) {
                     opts.time_filter_active = true;
                     snprintf(opts.time_clause, sizeof(opts.time_clause), "date(timestamp) = date('%s')", optarg);
                     snprintf(opts.time_description, sizeof(opts.time_description), "Custom Date: %s", optarg);
-                    has_query_flags = true;
                 }
                 break;
 
             case OPT_MIN_SIZE:
                 if (optarg) {
                     opts.min_bytes = parse_size_string(optarg);
-                    has_query_flags = true;
                 }
                 break;
 
@@ -870,12 +905,7 @@ int main(int argc, char *argv[]) {
                         fprintf(stderr, "Invalid sort option '%s'. Use 'asc' or 'desc'.\n", optarg);
                         return 1;
                     }
-                    has_query_flags = true;
                 }
-                break;
-
-            case 'r':
-                opts.record_snapshot = true;
                 break;
 
             case 'D':
@@ -899,18 +929,14 @@ int main(int argc, char *argv[]) {
     }
 
     Database db = {0};
-    bool for_writing = (opts.run_daemon || opts.record_snapshot || (!has_query_flags));
-    if (!init_database(&db, for_writing)) {
+    if (!init_database(&db, opts.run_daemon)) {
         if (is_daemon_mode) closelog();
         return 1;
     }
 
-    if (opts.run_daemon || opts.record_snapshot) {
-        execute_collector(&db, opts.run_daemon);
-    } else if (has_query_flags) {
-        query_database(&db, &opts);
+    if (opts.run_daemon) {
+        run_daemon_collector(&db);
     } else {
-        execute_collector(&db, false);
         query_database(&db, &opts);
     }
 
