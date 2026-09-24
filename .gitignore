@@ -7,4 +7,7 @@ netmon
 .vscode/
 .idea/
 *.swp
-*~
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
