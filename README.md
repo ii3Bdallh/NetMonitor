@@ -42,7 +42,7 @@ sudo pacman -S base-devel
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/<your-username>/NetMonitor.git
+git clone https://github.com/ii3Bdallh/NetMonitor.git
 cd NetMonitor
 ```
 
@@ -172,6 +172,12 @@ sudo make uninstall
 2. **Socket Resolution**: Parses `/proc/net/tcp[6]` and `/proc/net/udp[6]` to record active connection inodes and socket queues.
 3. **PID Mapping**: Scans `/proc/[PID]/fd/*` using `readlink()` to map socket inodes to process IDs and reads `/proc/[PID]/comm` for application names without crashing if processes exit dynamically.
 4. **SQLite WAL Storage**: Automatically provisions `usage.db` with indexed `network_usage` tables and commits periodic batches via atomic transactions.
+
+---
+
+## 👨‍💻 Author
+
+Developed and maintained by **Abdallah Mamdouh** ([@ii3Bdallh](https://github.com/ii3Bdallh)).
 
 ---
 
