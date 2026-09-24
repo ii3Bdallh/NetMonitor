@@ -4,26 +4,135 @@
 [![Database](https://img.shields.io/badge/Database-SQLite3%20Amalgamation-lightgrey.svg)](https://www.sqlite.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%28Fedora%20%2F%20Ubuntu%20%2F%20Arch%29-orange.svg)](https://kernel.org)
 [![Service](https://img.shields.io/badge/Service-Systemd%20Daemon-brightgreen.svg)](https://systemd.io/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A lightweight, zero-dependency, high-performance Linux CLI tool and background daemon written in C. It continuously monitors and logs per-process network bandwidth consumption (download/upload) into an embedded SQLite database, offering flexible time and size-based SQL queries.
+A lightweight, zero-dependency, high-performance Linux network bandwidth monitoring tool and background daemon written in C. It continuously tracks per-process network consumption (Upload / Download) into an embedded SQLite database with atomic batch transactions, featuring **GlassWire-style breakdown** between external **Internet (WAN)** quota and internal **Local Network (LAN)** sharing.
+
+---
+
+## ⚡ Quick Start (For End-Users)
+
+If you just want to install and use NetMonitor immediately on your Linux system, run this single command:
+
+```bash
+git clone https://github.com/ii3Bdallh/NetMonitor.git && cd NetMonitor && sudo make install
+```
+
+> **What this does automatically:**
+> 1. Compiles the optimized binary.
+> 2. Installs `netmon` globally to `/usr/local/bin/netmon`.
+> 3. Configures and starts the background daemon `net_monitor.service` with `systemd` to log usage across reboots.
+
+### 🎯 Start Querying Immediately
+Once installed, run `netmon` from any terminal:
+
+```bash
+# View network usage for today (last 24 hours)
+netmon --last-day
+
+# View apps consuming 1 MB or more
+netmon --last-day --min 1M
+
+# See help & all available filters
+netmon --help
+```
 
 ---
 
 ## ✨ Features
 
 - 🚀 **Zero External Dependencies**: Statically linked with the embedded SQLite amalgamation (`sqlite3.c`).
-- 🔍 **Per-Process Tracking**: Programmatically correlates active socket inodes in `/proc/net/tcp` and `/proc/net/udp` with process descriptors in `/proc/[PID]/fd` and process names in `/proc/[PID]/comm`.
-- ⚡ **Ultra-Fast Batch Transactions**: Employs SQLite WAL mode (`Write-Ahead Logging`) for non-blocking sub-millisecond batch inserts every 60 seconds.
-- 🌐 **Internet vs LAN Breakdown**: Distinguishes between external Internet (WAN) quota consumption and internal Local Network (LAN / Wi-Fi sharing / Docker) traffic.
-- 🕒 **Flexible CLI Time Filters**: Query historical network usage by minutes, hours, days, weeks, months, or exact custom dates.
-- 📊 **SQL-Driven Queries & Sorting**: All filtering, aggregation, and sorting are executed directly within SQL (`WHERE`, `HAVING`, `ORDER BY`).
-- 🛡️ **Systemd Background Daemon**: Runs silently as a detached background service with double-fork daemonization and `syslog` integration.
+- 🔍 **Precise Per-Process Attribution**: Correlates active TCP/UDP socket descriptors in `/proc/net/tcp[6]` & `/proc/net/udp[6]` with `/proc/[PID]/fd` and per-process I/O metrics in `/proc/[PID]/io`.
+- 🌐 **Internet (WAN) vs Local (LAN) Classification**: Accurately differentiates between external internet traffic (eating your quota) and local transfers (KDE Connect, local Wi-Fi sharing, SSHFS, Docker, LAN).
+- ⚡ **Non-Blocking WAL Batch Commits**: Commits aggregated process bandwidth to SQLite every 60 seconds inside fast Write-Ahead Log (WAL) transactions without freezing tracking loops.
+- 🕒 **Rich SQL-Driven CLI Filters**: Filter by minutes, hours, days, weeks, months, or custom calendar dates (`WHERE`, `HAVING`, `ORDER BY` executed inside SQL).
+- 🧹 **Database Management**: Built-in `--clear` flag to easily purge historical records and vacuum storage.
+- 🛡️ **Silent Background Daemon**: Production-ready double-fork daemon with `syslog` integration and `systemd` management.
 
 ---
 
-## 📋 Requirements
+## 🖥️ Live Output Preview
 
-Any standard Linux distribution (Fedora, Ubuntu, Debian, Arch Linux, etc.) with `gcc` and `make`:
+```text
+===================================================================================================
+                                   DATABASE QUERY RESULTS                                          
+===================================================================================================
+ Database: /var/lib/netmon/usage.db
+ Filter  : Last 2 Day(s)
+ Min Size: >= 1.00 MB
+ Sort    : Total Bytes DESC
+---------------------------------------------------------------------------------------------------
+APPLICATION              UPLOAD (TX)      DOWNLOAD (RX)    TOTAL USAGE      SAMPLES    LAST SEEN           
+---------------------------------------------------------------------------------------------------
+ssh                      1.17 MB          95.09 MB         96.26 MB         2          2026-09-24 12:16:38 
+antigravity-ide          118.90 KB        1.64 MB          1.76 MB          6          2026-09-24 12:16:38 
+brave                    90.12 KB         1.57 MB          1.65 MB          6          2026-09-24 12:16:38 
+---------------------------------------------------------------------------------------------------
+TOTAL AGGREGATED         1.38 MB          98.29 MB         99.67 MB         Total Rows: 3
+---------------------------------------------------------------------------------------------------
+  🌐 Internet / WAN (Quota Usage) : 1.48 MB    (Upload: 343.44 KB | Download: 1.14 MB  )
+  🏠 Local / LAN    (Network Sharing): 99.55 MB   (Upload: 1.36 MB   | Download: 98.18 MB )
+===================================================================================================
+```
+
+---
+
+## 🚀 CLI Usage & Filter Options
+
+### 1. Time Filters
+```bash
+# Last 30 minutes
+netmon --last-minute 30
+
+# Last 6 hours
+netmon --last-hour 6
+
+# Today / Last 24 hours (or N days: netmon --last-day 5)
+netmon --last-day
+
+# Last 2 weeks
+netmon --last-week 2
+
+# Last month
+netmon --last-month 1
+
+# Specific custom date
+netmon --custom "2026-09-24"
+```
+
+### 2. Size Filters (`--min`)
+```bash
+# Only show applications that consumed >= 500 KB
+netmon --last-day --min 500K
+
+# Show heavy consumers (>= 100 MB)
+netmon --last-week --min 100M
+
+# Show applications with >= 1 GB
+netmon --min 1G
+```
+
+### 3. Sorting (`--sort`)
+```bash
+# Highest consumption first (default)
+netmon --last-day --sort desc
+
+# Lowest consumption first
+netmon --last-day --sort asc
+```
+
+### 4. Reset / Clear Database History (`--clear`)
+```bash
+# Purge all historical usage records and vacuum the SQLite database
+netmon --clear
+```
+
+---
+
+## 🛠️ For Developers & Contributors
+
+### Prerequisites
+Make sure you have standard build tools installed:
 
 ```bash
 # Fedora / RHEL
@@ -36,142 +145,56 @@ sudo apt install build-essential
 sudo pacman -S base-devel
 ```
 
----
-
-## ⚡ Quick Start (Build & Install)
-
-### 1. Clone the Repository
+### Manual Compilation
 ```bash
-git clone https://github.com/ii3Bdallh/NetMonitor.git
-cd NetMonitor
-```
-
-### 2. Build the Project
-```bash
+# Build the binary locally
 make
-```
 
-### 3. Install & Start as a Background Service (One-Command)
-```bash
+# Clean build artifacts
+make clean
+
+# Install or reinstall system-wide
 sudo make install
-```
-> **What this does:**
-> 1. Installs the binary to `/usr/local/bin/netmon`.
-> 2. Configures and enables the systemd service `/etc/systemd/system/net_monitor.service`.
-> 3. Starts background data collection immediately and across reboots.
 
----
-
-## 🚀 CLI Usage & Query Examples
-
-Once installed, you can run `netmon` from anywhere in your terminal:
-
-### 1. Help & Options
-```bash
-netmon --help
-```
-
-### 2. Filter by Time
-```bash
-# Usage in the last 30 minutes
-netmon --last-minute 30
-
-# Usage in the last 6 hours
-netmon --last-hour 6
-
-# Usage today (last 24 hours) sorted descending
-netmon --last-day --sort desc
-
-# Usage in the last 7 days (or any N days, e.g., --last-day 5)
-netmon --last-day 5
-
-# Usage in the last 4 weeks
-netmon --last-week 4
-
-# Usage in the last 2 months
-netmon --last-month 2
-
-# Usage on a specific custom date
-netmon --custom "2026-09-24"
-```
-
-### 3. Filter by Minimum Consumption (`--min`)
-```bash
-# Show applications that used 500 KB or more in the last 24 hours
-netmon --last-day --min 500K
-
-# Show heavy consumers (> 100 MB) in the last week
-netmon --last-week --min 100M
-
-# Show applications with >= 1 GB of traffic
-netmon --min 1G
-```
-
-### 4. Sort Direction (`--sort`)
-```bash
-# Sort by highest traffic first (default)
-netmon --last-day --sort desc
-
-# Sort by lowest traffic first
-netmon --last-day --sort asc
-```
-
-### 5. Clear Database History (`--clear` / `--reset`)
-```bash
-# Clear all historical usage records and vacuum database
-netmon --clear
-```
-
----
-
-## 🖥️ Example Output
-
-```text
-===================================================================================================
-                                   DATABASE QUERY RESULTS                                          
-===================================================================================================
- Filter  : Last 1 Day(s)
- Sort    : Total Bytes DESC
----------------------------------------------------------------------------------------------------
-APPLICATION              SENT (TX)        RECEIVED (RX)    TOTAL USAGE      SAMPLES    LAST SEEN           
----------------------------------------------------------------------------------------------------
-kdeconnectd              21.02 KB         0 B              21.02 KB         7          2026-09-24 11:00:25 
-rclone                   1.75 KB          0 B              1.75 KB          3          2026-09-24 10:58:25 
-language_server          1.01 KB          0 B              1.01 KB          14         2026-09-24 11:00:25 
-antigravity-ide          0 B              0 B              0 B              21         2026-09-24 11:00:25 
-brave                    0 B              0 B              0 B              14         2026-09-24 11:00:25 
----------------------------------------------------------------------------------------------------
-TOTAL AGGREGATED         23.78 KB         0 B              23.78 KB         Total Rows: 5
-===================================================================================================
-```
-
----
-
-## 🔧 Managing the Background Service
-
-```bash
-# Check service status
-sudo systemctl status net_monitor.service
-
-# View live daemon logs
-journalctl -u net_monitor.service -f
-
-# Stop or restart the service
-sudo systemctl stop net_monitor.service
-sudo systemctl restart net_monitor.service
-
-# Uninstall completely
+# Completely uninstall from system
 sudo make uninstall
 ```
 
+### Project Structure
+```text
+NetMonitor/
+├── main.c                 # Core engine (packet attribution, sockets, SQLite, CLI)
+├── sqlite3.c              # SQLite 3.46.1 amalgamation source
+├── sqlite3.h              # SQLite C API header
+├── Makefile               # Automated build, install & uninstall scripts
+├── net_monitor.service    # Systemd daemon service unit
+└── README.md              # Documentation
+```
+
 ---
 
-## 🏗️ Architecture & How It Works
+## 🔧 Managing the Background Daemon
 
-1. **Active Interface Detection**: Reads `/proc/net/dev` to locate the main network interface (Wi-Fi/Ethernet) and capture hardware-level RX/TX traffic.
-2. **Socket Resolution**: Parses `/proc/net/tcp[6]` and `/proc/net/udp[6]` to record active connection inodes and socket queues.
-3. **PID Mapping**: Scans `/proc/[PID]/fd/*` using `readlink()` to map socket inodes to process IDs and reads `/proc/[PID]/comm` for application names without crashing if processes exit dynamically.
-4. **SQLite WAL Storage**: Automatically provisions `usage.db` with indexed `network_usage` tables and commits periodic batches via atomic transactions.
+```bash
+# Check daemon service status
+sudo systemctl status net_monitor.service
+
+# Stream live background logs
+journalctl -u net_monitor.service -f
+
+# Restart or Stop daemon
+sudo systemctl restart net_monitor.service
+sudo systemctl stop net_monitor.service
+```
+
+---
+
+## 🏗️ Technical Architecture
+
+1. **Active Hardware Interface**: Inspects `/proc/net/dev` to locate active network interfaces (Wi-Fi `wlp*`, Ethernet `eth*`, `enp*`) and measure hardware-level RX/TX delta rates.
+2. **Socket Resolution & Subnet Parsing**: Scans `/proc/net/tcp[6]` and `/proc/net/udp[6]` to extract connection inodes and remote destination IPs. IPs are mapped to RFC 1918 subnets (`192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`, Link-Local, IPv6 local, port 1716) to distinguish LAN from WAN.
+3. **Process I/O Correlation**: Reads `/proc/[PID]/io` and `/proc/[PID]/fd/*` using `readlink()`, mapping kernel socket descriptors to specific running process names (`/proc/[PID]/comm`).
+4. **SQLite WAL Persistence**: Database stored in `/var/lib/netmon/usage.db` (with user fallback) updated atomically in 60-second batch intervals for maximum disk write efficiency.
 
 ---
 
@@ -183,4 +206,4 @@ Developed and maintained by **Abdallah Mamdouh** ([@ii3Bdallh](https://github.co
 
 ## 📜 License
 
-MIT License. Feel free to use, modify, and distribute.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
