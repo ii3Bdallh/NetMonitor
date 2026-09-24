@@ -21,7 +21,8 @@
 #define PROC_NET_DEV "/proc/net/dev"
 #define BUFFER_SIZE 512
 #define BATCH_INTERVAL_SECONDS 60
-#define MAX_TRACKED_APPS 256
+#define MAX_TRACKED_APPS 512
+#define MAX_PIDS 4096
 
 static volatile bool keep_running = true;
 static bool is_daemon_mode = false;
@@ -267,10 +268,9 @@ bool get_active_interface_stats(NetInterface *iface) {
 
 typedef struct {
     unsigned long inode;
-    bool is_established; // State 01 = ESTABLISHED
-    bool is_remote;      // Not localhost
+    bool is_established;
+    bool is_remote;
     pid_t pid;
-    char comm[64];
 } SocketEntry;
 
 typedef struct {
@@ -281,7 +281,7 @@ typedef struct {
 
 void init_socket_list(SocketList *list) {
     list->count = 0;
-    list->capacity = 128;
+    list->capacity = 256;
     list->entries = malloc(list->capacity * sizeof(SocketEntry));
 }
 
@@ -300,7 +300,6 @@ void add_socket(SocketList *list, unsigned long inode, bool is_est, bool is_remo
     list->entries[list->count].is_established = is_est;
     list->entries[list->count].is_remote = is_remote;
     list->entries[list->count].pid = 0;
-    list->entries[list->count].comm[0] = '\0';
     list->count++;
 }
 
@@ -338,9 +337,8 @@ void parse_proc_net_file(const char *path, SocketList *list) {
                &dummy_d1, &dummy_d2, &inode);
 
         if (num_matched >= 11 && inode > 0) {
-            // Check if remote address is not 00000000:0000 and not 127.0.0.1 (0100007F)
             bool is_remote = (strncmp(rem_addr, "00000000", 8) != 0 && strncmp(rem_addr, "0100007F", 8) != 0);
-            bool is_est = (state == 1); // 01 = ESTABLISHED
+            bool is_est = (state == 1);
             add_socket(list, inode, is_est, is_remote);
         }
     }
@@ -368,15 +366,123 @@ void get_process_comm(pid_t pid, char *dest, size_t max_len) {
     }
 }
 
-void scan_proc_fds(SocketList *list) {
+// Read /proc/[PID]/io to get exact per-process syscall read/write traffic
+bool get_process_io_bytes(pid_t pid, unsigned long long *rchar, unsigned long long *wchar) {
+    char io_path[128];
+    snprintf(io_path, sizeof(io_path), "/proc/%d/io", pid);
+
+    FILE *f = fopen(io_path, "r");
+    if (!f) return false;
+
+    char line[128];
+    *rchar = 0;
+    *wchar = 0;
+    int matched = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "rchar:", 6) == 0) {
+            *rchar = strtoull(line + 6, NULL, 10);
+            matched++;
+        } else if (strncmp(line, "wchar:", 6) == 0) {
+            *wchar = strtoull(line + 6, NULL, 10);
+            matched++;
+        }
+        if (matched >= 2) break;
+    }
+
+    fclose(f);
+    return (matched >= 2);
+}
+
+// ==========================================
+// Precise Per-Process Tracking Engine
+// ==========================================
+typedef struct {
+    pid_t pid;
+    char comm[64];
+    unsigned long long prev_rchar;
+    unsigned long long prev_wchar;
+    unsigned long long delta_rchar;
+    unsigned long long delta_wchar;
+    bool has_network_socket;
+    bool has_active_stream;
+    bool seen;
+} PidSnapshot;
+
+typedef struct {
+    char app_name[64];
+    unsigned long long accumulated_upload;   // TX
+    unsigned long long accumulated_download; // RX
+} AppBandwidth;
+
+typedef struct {
+    AppBandwidth apps[MAX_TRACKED_APPS];
+    size_t count;
+    PidSnapshot pids[MAX_PIDS];
+    size_t pid_count;
+} BandwidthTracker;
+
+void init_tracker(BandwidthTracker *tracker) {
+    tracker->count = 0;
+    tracker->pid_count = 0;
+    memset(tracker->apps, 0, sizeof(tracker->apps));
+    memset(tracker->pids, 0, sizeof(tracker->pids));
+}
+
+AppBandwidth* get_or_create_app(BandwidthTracker *tracker, const char *name) {
+    for (size_t i = 0; i < tracker->count; i++) {
+        if (strcmp(tracker->apps[i].app_name, name) == 0) {
+            return &tracker->apps[i];
+        }
+    }
+    if (tracker->count < MAX_TRACKED_APPS) {
+        size_t idx = tracker->count++;
+        snprintf(tracker->apps[idx].app_name, sizeof(tracker->apps[idx].app_name), "%s", name);
+        tracker->apps[idx].accumulated_upload = 0;
+        tracker->apps[idx].accumulated_download = 0;
+        return &tracker->apps[idx];
+    }
+    return NULL;
+}
+
+PidSnapshot* get_or_create_pid(BandwidthTracker *tracker, pid_t pid) {
+    for (size_t i = 0; i < tracker->pid_count; i++) {
+        if (tracker->pids[i].pid == pid) {
+            return &tracker->pids[i];
+        }
+    }
+    if (tracker->pid_count < MAX_PIDS) {
+        size_t idx = tracker->pid_count++;
+        tracker->pids[idx].pid = pid;
+        get_process_comm(pid, tracker->pids[idx].comm, sizeof(tracker->pids[idx].comm));
+        tracker->pids[idx].prev_rchar = 0;
+        tracker->pids[idx].prev_wchar = 0;
+        tracker->pids[idx].delta_rchar = 0;
+        tracker->pids[idx].delta_wchar = 0;
+        tracker->pids[idx].has_network_socket = false;
+        tracker->pids[idx].has_active_stream = false;
+        tracker->pids[idx].seen = true;
+        return &tracker->pids[idx];
+    }
+    return NULL;
+}
+
+// Map network sockets to PIDs and sample process IO deltas
+void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_list) {
+    for (size_t i = 0; i < tracker->pid_count; i++) {
+        tracker->pids[i].seen = false;
+        tracker->pids[i].has_network_socket = false;
+        tracker->pids[i].has_active_stream = false;
+        tracker->pids[i].delta_rchar = 0;
+        tracker->pids[i].delta_wchar = 0;
+    }
+
     DIR *proc_dir = opendir("/proc");
     if (!proc_dir) return;
 
     struct dirent *proc_entry;
     while ((proc_entry = readdir(proc_dir)) != NULL) {
-        if (!isdigit(proc_entry->d_name[0])) {
-            continue;
-        }
+        if (!isdigit(proc_entry->d_name[0])) continue;
 
         pid_t pid = (pid_t)atoi(proc_entry->d_name);
         if (pid <= 0) continue;
@@ -385,12 +491,10 @@ void scan_proc_fds(SocketList *list) {
         snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", pid);
 
         DIR *fd_dir = opendir(fd_dir_path);
-        if (!fd_dir) {
-            continue;
-        }
+        if (!fd_dir) continue;
 
-        char comm[64] = {0};
-        bool comm_cached = false;
+        bool has_net = false;
+        bool has_active = false;
 
         struct dirent *fd_entry;
         while ((fd_entry = readdir(fd_dir)) != NULL) {
@@ -406,117 +510,119 @@ void scan_proc_fds(SocketList *list) {
 
             unsigned long inode = 0;
             if (sscanf(link_target, "socket:[%lu]", &inode) == 1 && inode > 0) {
-                for (size_t i = 0; i < list->count; i++) {
-                    if (list->entries[i].inode == inode) {
-                        list->entries[i].pid = pid;
-                        if (!comm_cached) {
-                            get_process_comm(pid, comm, sizeof(comm));
-                            comm_cached = true;
+                has_net = true;
+                // Check if this socket is active/established
+                for (size_t s = 0; s < sock_list->count; s++) {
+                    if (sock_list->entries[s].inode == inode) {
+                        if (sock_list->entries[s].is_established) {
+                            has_active = true;
                         }
-                        snprintf(list->entries[i].comm, sizeof(list->entries[i].comm), "%s", comm);
                     }
                 }
             }
         }
         closedir(fd_dir);
+
+        if (has_net) {
+            PidSnapshot *ps = get_or_create_pid(tracker, pid);
+            if (ps) {
+                ps->seen = true;
+                ps->has_network_socket = true;
+                ps->has_active_stream = has_active;
+
+                unsigned long long rchar = 0, wchar = 0;
+                if (get_process_io_bytes(pid, &rchar, &wchar)) {
+                    if (ps->prev_rchar > 0 && rchar >= ps->prev_rchar) {
+                        ps->delta_rchar = rchar - ps->prev_rchar;
+                    }
+                    if (ps->prev_wchar > 0 && wchar >= ps->prev_wchar) {
+                        ps->delta_wchar = wchar - ps->prev_wchar;
+                    }
+                    ps->prev_rchar = rchar;
+                    ps->prev_wchar = wchar;
+                }
+            }
+        }
     }
     closedir(proc_dir);
 }
 
-// ==========================================
-// In-Memory Bandwidth Accumulator
-// ==========================================
-typedef struct {
-    char app_name[64];
-    unsigned long long accumulated_tx;
-    unsigned long long accumulated_rx;
-    int active_weight;
-} AppBandwidth;
-
-typedef struct {
-    AppBandwidth apps[MAX_TRACKED_APPS];
-    size_t count;
-} BandwidthTracker;
-
-void init_tracker(BandwidthTracker *tracker) {
-    tracker->count = 0;
-    memset(tracker->apps, 0, sizeof(tracker->apps));
-}
-
-AppBandwidth* get_or_create_app(BandwidthTracker *tracker, const char *name) {
-    for (size_t i = 0; i < tracker->count; i++) {
-        if (strcmp(tracker->apps[i].app_name, name) == 0) {
-            return &tracker->apps[i];
-        }
-    }
-    if (tracker->count < MAX_TRACKED_APPS) {
-        size_t idx = tracker->count++;
-        snprintf(tracker->apps[idx].app_name, sizeof(tracker->apps[idx].app_name), "%s", name);
-        tracker->apps[idx].accumulated_tx = 0;
-        tracker->apps[idx].accumulated_rx = 0;
-        tracker->apps[idx].active_weight = 0;
-        return &tracker->apps[idx];
-    }
-    return NULL;
-}
-
-// Distribute measured delta network interface bytes to currently active connected apps
-void track_traffic_sample(BandwidthTracker *tracker, const SocketList *list, unsigned long long delta_rx, unsigned long long delta_tx) {
+// Accurately distribute network interface delta (RX/TX) based on actual process IO delta
+void attribute_bandwidth(BandwidthTracker *tracker, unsigned long long delta_rx, unsigned long long delta_tx) {
     if (delta_rx == 0 && delta_tx == 0) return;
 
-    // Reset current active weights
-    for (size_t i = 0; i < tracker->count; i++) {
-        tracker->apps[i].active_weight = 0;
+    unsigned long long total_active_rchar = 0;
+    unsigned long long total_active_wchar = 0;
+    int active_stream_count = 0;
+
+    for (size_t i = 0; i < tracker->pid_count; i++) {
+        if (!tracker->pids[i].seen || !tracker->pids[i].has_network_socket) continue;
+
+        if (tracker->pids[i].has_active_stream) {
+            active_stream_count++;
+        }
+        total_active_rchar += tracker->pids[i].delta_rchar;
+        total_active_wchar += tracker->pids[i].delta_wchar;
     }
 
-    int total_weight = 0;
-
-    for (size_t i = 0; i < list->count; i++) {
-        if (list->entries[i].pid <= 0 || strlen(list->entries[i].comm) == 0) continue;
-
-        // Give high priority to ESTABLISHED remote internet sockets
-        int weight = 1;
-        if (list->entries[i].is_established && list->entries[i].is_remote) {
-            weight = 10;
-        } else if (list->entries[i].is_established) {
-            weight = 5;
-        } else if (list->entries[i].is_remote) {
-            weight = 3;
-        }
-
-        AppBandwidth *app = get_or_create_app(tracker, list->entries[i].comm);
-        if (app) {
-            app->active_weight += weight;
-            total_weight += weight;
-        }
-    }
-
-    if (total_weight > 0) {
-        for (size_t i = 0; i < tracker->count; i++) {
-            if (tracker->apps[i].active_weight > 0) {
-                unsigned long long share_rx = (delta_rx * tracker->apps[i].active_weight) / total_weight;
-                unsigned long long share_tx = (delta_tx * tracker->apps[i].active_weight) / total_weight;
-                tracker->apps[i].accumulated_rx += share_rx;
-                tracker->apps[i].accumulated_tx += share_tx;
+    // 1. Distribute Download (RX)
+    if (delta_rx > 0) {
+        if (total_active_rchar > 0) {
+            for (size_t i = 0; i < tracker->pid_count; i++) {
+                if (!tracker->pids[i].seen || tracker->pids[i].delta_rchar == 0) continue;
+                unsigned long long share_rx = (delta_rx * tracker->pids[i].delta_rchar) / total_active_rchar;
+                if (share_rx > 0) {
+                    AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
+                    if (app) app->accumulated_download += share_rx;
+                }
             }
+        } else if (active_stream_count > 0) {
+            // Fallback to active established stream processes
+            unsigned long long share_rx = delta_rx / active_stream_count;
+            for (size_t i = 0; i < tracker->pid_count; i++) {
+                if (tracker->pids[i].seen && tracker->pids[i].has_active_stream) {
+                    AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
+                    if (app) app->accumulated_download += share_rx;
+                }
+            }
+        } else {
+            AppBandwidth *app = get_or_create_app(tracker, "system-network");
+            if (app) app->accumulated_download += delta_rx;
         }
-    } else {
-        // If traffic occurred during short-lived connection (e.g. fast curl), assign to system/network daemon
-        AppBandwidth *app = get_or_create_app(tracker, "system-traffic");
-        if (app) {
-            app->accumulated_rx += delta_rx;
-            app->accumulated_tx += delta_tx;
+    }
+
+    // 2. Distribute Upload (TX)
+    if (delta_tx > 0) {
+        if (total_active_wchar > 0) {
+            for (size_t i = 0; i < tracker->pid_count; i++) {
+                if (!tracker->pids[i].seen || tracker->pids[i].delta_wchar == 0) continue;
+                unsigned long long share_tx = (delta_tx * tracker->pids[i].delta_wchar) / total_active_wchar;
+                if (share_tx > 0) {
+                    AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
+                    if (app) app->accumulated_upload += share_tx;
+                }
+            }
+        } else if (active_stream_count > 0) {
+            unsigned long long share_tx = delta_tx / active_stream_count;
+            for (size_t i = 0; i < tracker->pid_count; i++) {
+                if (tracker->pids[i].seen && tracker->pids[i].has_active_stream) {
+                    AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
+                    if (app) app->accumulated_upload += share_tx;
+                }
+            }
+        } else {
+            AppBandwidth *app = get_or_create_app(tracker, "system-network");
+            if (app) app->accumulated_upload += delta_tx;
         }
     }
 }
 
-// Flush accumulated non-zero bandwidth into SQLite
 bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
     if (!database->db || !database->insert_stmt) return false;
 
     bool has_records = false;
     for (size_t i = 0; i < tracker->count; i++) {
-        if (tracker->apps[i].accumulated_rx > 0 || tracker->apps[i].accumulated_tx > 0) {
+        if (tracker->apps[i].accumulated_download > 0 || tracker->apps[i].accumulated_upload > 0) {
             has_records = true;
             break;
         }
@@ -527,19 +633,18 @@ bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
     sqlite3_exec(database->db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
 
     for (size_t i = 0; i < tracker->count; i++) {
-        if (tracker->apps[i].accumulated_rx > 0 || tracker->apps[i].accumulated_tx > 0) {
+        if (tracker->apps[i].accumulated_download > 0 || tracker->apps[i].accumulated_upload > 0) {
             sqlite3_reset(database->insert_stmt);
             sqlite3_clear_bindings(database->insert_stmt);
 
             sqlite3_bind_text(database->insert_stmt, 1, tracker->apps[i].app_name, -1, SQLITE_STATIC);
-            sqlite3_bind_int64(database->insert_stmt, 2, (sqlite3_int64)tracker->apps[i].accumulated_tx);
-            sqlite3_bind_int64(database->insert_stmt, 3, (sqlite3_int64)tracker->apps[i].accumulated_rx);
+            sqlite3_bind_int64(database->insert_stmt, 2, (sqlite3_int64)tracker->apps[i].accumulated_upload);
+            sqlite3_bind_int64(database->insert_stmt, 3, (sqlite3_int64)tracker->apps[i].accumulated_download);
 
             sqlite3_step(database->insert_stmt);
 
-            // Reset accumulator after committing
-            tracker->apps[i].accumulated_tx = 0;
-            tracker->apps[i].accumulated_rx = 0;
+            tracker->apps[i].accumulated_upload = 0;
+            tracker->apps[i].accumulated_download = 0;
         }
     }
 
@@ -636,10 +741,11 @@ void query_database(Database *database, const CliOptions *opts) {
 
     const char *order_dir = opts->sort_asc ? "ASC" : "DESC";
 
-    snprintf(sql, sizeof(sql),
+    snprintf(sql,
+             sizeof(sql),
              "SELECT app_name, "
-             "       SUM(bytes_sent) AS total_sent, "
-             "       SUM(bytes_received) AS total_recv, "
+             "       SUM(bytes_sent) AS total_upload, "
+             "       SUM(bytes_received) AS total_download, "
              "       SUM(bytes_sent + bytes_received) AS total_bytes, "
              "       COUNT(*) AS entries_count, "
              "       MAX(timestamp) AS last_seen "
@@ -670,36 +776,36 @@ void query_database(Database *database, const CliOptions *opts) {
     printf(" Sort    : Total Bytes %s\n", order_dir);
     printf("---------------------------------------------------------------------------------------------------\n");
     printf("%-24s %-16s %-16s %-16s %-10s %-20s\n",
-           "APPLICATION", "SENT (TX)", "RECEIVED (RX)", "TOTAL USAGE", "SAMPLES", "LAST SEEN");
+           "APPLICATION", "UPLOAD (TX)", "DOWNLOAD (RX)", "TOTAL USAGE", "SAMPLES", "LAST SEEN");
     printf("---------------------------------------------------------------------------------------------------\n");
 
     int row_count = 0;
-    unsigned long long grand_total_sent = 0;
-    unsigned long long grand_total_recv = 0;
+    unsigned long long grand_total_upload = 0;
+    unsigned long long grand_total_download = 0;
 
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const unsigned char *app = sqlite3_column_text(stmt, 0);
-        unsigned long long sent = (unsigned long long)sqlite3_column_int64(stmt, 1);
-        unsigned long long recv = (unsigned long long)sqlite3_column_int64(stmt, 2);
+        unsigned long long upload = (unsigned long long)sqlite3_column_int64(stmt, 1);
+        unsigned long long download = (unsigned long long)sqlite3_column_int64(stmt, 2);
         unsigned long long total = (unsigned long long)sqlite3_column_int64(stmt, 3);
         int samples = sqlite3_column_int(stmt, 4);
         const unsigned char *last_seen = sqlite3_column_text(stmt, 5);
 
-        char sent_str[32], recv_str[32], total_str[32];
-        format_bytes(sent, sent_str, sizeof(sent_str));
-        format_bytes(recv, recv_str, sizeof(recv_str));
+        char upload_str[32], download_str[32], total_str[32];
+        format_bytes(upload, upload_str, sizeof(upload_str));
+        format_bytes(download, download_str, sizeof(download_str));
         format_bytes(total, total_str, sizeof(total_str));
 
         printf("%-24s %-16s %-16s %-16s %-10d %-20s\n",
                app ? (const char *)app : "[unknown]",
-               sent_str,
-               recv_str,
+               upload_str,
+               download_str,
                total_str,
                samples,
                last_seen ? (const char *)last_seen : "-");
 
-        grand_total_sent += sent;
-        grand_total_recv += recv;
+        grand_total_upload += upload;
+        grand_total_download += download;
         row_count++;
     }
 
@@ -707,13 +813,13 @@ void query_database(Database *database, const CliOptions *opts) {
         printf("  No matching records found in database for the given criteria.\n");
     } else {
         printf("---------------------------------------------------------------------------------------------------\n");
-        char total_sent_str[32], total_recv_str[32], grand_total_str[32];
-        format_bytes(grand_total_sent, total_sent_str, sizeof(total_sent_str));
-        format_bytes(grand_total_recv, total_recv_str, sizeof(total_recv_str));
-        format_bytes(grand_total_sent + grand_total_recv, grand_total_str, sizeof(grand_total_str));
+        char total_up_str[32], total_down_str[32], grand_total_str[32];
+        format_bytes(grand_total_upload, total_up_str, sizeof(total_up_str));
+        format_bytes(grand_total_download, total_down_str, sizeof(total_down_str));
+        format_bytes(grand_total_upload + grand_total_download, grand_total_str, sizeof(grand_total_str));
 
         printf("%-24s %-16s %-16s %-16s Total Rows: %d\n",
-               "TOTAL AGGREGATED", total_sent_str, total_recv_str, grand_total_str, row_count);
+               "TOTAL AGGREGATED", total_up_str, total_down_str, grand_total_str, row_count);
     }
     printf("===================================================================================================\n\n");
 
@@ -758,9 +864,8 @@ void run_daemon_collector(Database *db) {
                 parse_proc_net_file("/proc/net/udp", &sock_list);
                 parse_proc_net_file("/proc/net/udp6", &sock_list);
 
-                scan_proc_fds(&sock_list);
-
-                track_traffic_sample(&tracker, &sock_list, delta_rx, delta_tx);
+                sample_process_activity(&tracker, &sock_list);
+                attribute_bandwidth(&tracker, delta_rx, delta_tx);
 
                 free_socket_list(&sock_list);
             }
@@ -780,7 +885,6 @@ void run_daemon_collector(Database *db) {
         }
     }
 
-    // Flush any remaining traffic on shutdown
     flush_tracker_to_db(db, &tracker);
     log_message(LOG_INFO, "NetMonitor background collector stopped gracefully.");
 }
