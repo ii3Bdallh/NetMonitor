@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <dirent.h>
 #include <ctype.h>
@@ -12,15 +11,8 @@
 #define PROC_NET_DEV "/proc/net/dev"
 #define BUFFER_SIZE 512
 
-static volatile bool keep_running = true;
-
-void handle_sigint(int sig) {
-    (void)sig;
-    keep_running = false;
-}
-
 // ==========================================
-// Total Network Interface Stats (from Stage 1)
+// Total Network Interface Stats
 // ==========================================
 typedef struct {
     char name[32];
@@ -83,7 +75,7 @@ bool get_active_interface_stats(NetInterface *iface) {
 }
 
 // ==========================================
-// Per-Process Network Tracking (Stage 2)
+// Per-Process Network Tracking
 // ==========================================
 typedef enum {
     PROTO_TCP,
@@ -148,7 +140,6 @@ void parse_proc_net_file(const char *path, SocketProto proto, SocketList *list) 
     if (!f) return;
 
     char line[BUFFER_SIZE];
-    // Skip header
     if (!fgets(line, sizeof(line), f)) {
         fclose(f);
         return;
@@ -319,12 +310,12 @@ void print_per_process_stats(const SocketList *list) {
 
     qsort(procs, proc_count, sizeof(ProcessNetUsage), compare_proc_usage);
 
-    printf("\n%-8s %-20s %-12s %-12s %-15s\n", "PID", "APPLICATION", "TCP SOCKETS", "UDP SOCKETS", "QUEUED (RX/TX)");
+    printf("\n%-8s %-22s %-12s %-12s %-15s\n", "PID", "APPLICATION", "TCP SOCKETS", "UDP SOCKETS", "QUEUED (RX/TX)");
     printf("-------------------------------------------------------------------------\n");
 
     size_t max_display = proc_count < 15 ? proc_count : 15;
     for (size_t i = 0; i < max_display; i++) {
-        printf("%-8d %-20s %-12d %-12d %llu / %llu B\n",
+        printf("%-8d %-22s %-12d %-12d %llu / %llu B\n",
                procs[i].pid,
                procs[i].comm,
                procs[i].tcp_sockets,
@@ -334,56 +325,46 @@ void print_per_process_stats(const SocketList *list) {
     }
 
     if (proc_count == 0) {
-        printf("  No active user socket associations found.\n");
+        printf("  No active socket associations found.\n");
     }
     printf("-------------------------------------------------------------------------\n");
 }
 
 int main(void) {
-    signal(SIGINT, handle_sigint);
-
     NetInterface active_iface;
 
-    while (keep_running) {
-        // Clear terminal screen for clean live dashboard
-        printf("\033[H\033[J");
-        printf("=========================================================================\n");
-        printf("     Network Usage Monitor - Stage 2 (Per-Process Tracking)             \n");
-        printf("=========================================================================\n");
+    printf("=========================================================================\n");
+    printf("     Network Usage Monitor - Snapshot Report                             \n");
+    printf("=========================================================================\n");
 
-        // 1. Overall network interface stats
-        if (get_active_interface_stats(&active_iface)) {
-            double rx_mb = (double)active_iface.rx_bytes / (1024.0 * 1024.0);
-            double tx_mb = (double)active_iface.tx_bytes / (1024.0 * 1024.0);
-            double total_mb = rx_mb + tx_mb;
+    // 1. Overall network interface stats
+    if (get_active_interface_stats(&active_iface)) {
+        double rx_mb = (double)active_iface.rx_bytes / (1024.0 * 1024.0);
+        double tx_mb = (double)active_iface.tx_bytes / (1024.0 * 1024.0);
+        double total_mb = rx_mb + tx_mb;
 
-            printf(" Active Interface : %s\n", active_iface.name);
-            printf(" Total Download   : %8.2f MB\n", rx_mb);
-            printf(" Total Upload     : %8.2f MB\n", tx_mb);
-            printf(" Total Traffic    : %8.2f MB\n", total_mb);
-        }
-
-        // 2. Per-process network sockets
-        SocketList sock_list;
-        init_socket_list(&sock_list);
-
-        parse_proc_net_file("/proc/net/tcp", PROTO_TCP, &sock_list);
-        parse_proc_net_file("/proc/net/tcp6", PROTO_TCP, &sock_list);
-        parse_proc_net_file("/proc/net/udp", PROTO_UDP, &sock_list);
-        parse_proc_net_file("/proc/net/udp6", PROTO_UDP, &sock_list);
-
-        scan_proc_fds(&sock_list);
-
-        print_per_process_stats(&sock_list);
-
-        free_socket_list(&sock_list);
-
-        printf("\nPress Ctrl+C to stop.\n");
-        fflush(stdout);
-
-        sleep(1);
+        printf(" Active Interface : %s\n", active_iface.name);
+        printf(" Total Download   : %8.2f MB\n", rx_mb);
+        printf(" Total Upload     : %8.2f MB\n", tx_mb);
+        printf(" Total Traffic    : %8.2f MB\n", total_mb);
+    } else {
+        printf(" Active Interface : None detected\n");
     }
 
-    printf("\n\nMonitoring stopped successfully.\n");
+    // 2. Per-process network sockets
+    SocketList sock_list;
+    init_socket_list(&sock_list);
+
+    parse_proc_net_file("/proc/net/tcp", PROTO_TCP, &sock_list);
+    parse_proc_net_file("/proc/net/tcp6", PROTO_TCP, &sock_list);
+    parse_proc_net_file("/proc/net/udp", PROTO_UDP, &sock_list);
+    parse_proc_net_file("/proc/net/udp6", PROTO_UDP, &sock_list);
+
+    scan_proc_fds(&sock_list);
+
+    print_per_process_stats(&sock_list);
+
+    free_socket_list(&sock_list);
+
     return 0;
 }
