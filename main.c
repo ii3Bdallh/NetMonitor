@@ -174,7 +174,6 @@ bool init_database(Database *database, bool for_writing) {
             sqlite3_free(err_msg);
         }
 
-        // Automatic column migration if table existed before without is_local
         sqlite3_exec(database->db, "ALTER TABLE network_usage ADD COLUMN is_local INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
 
         const char *insert_sql =
@@ -268,24 +267,50 @@ bool get_active_interface_stats(NetInterface *iface) {
     return found;
 }
 
-// Check if hex IP from /proc/net/tcp is in private LAN ranges (RFC 1918, loopback, multicast)
+// Check if an IPv4 or IPv6 address belongs to private/local network (RFC 1918, link-local, loopback)
 bool is_hex_ip_local(const char *hex_ip) {
-    if (!hex_ip || strlen(hex_ip) < 8) return false;
+    if (!hex_ip) return false;
+    size_t len = strlen(hex_ip);
+    if (len < 8) return false;
 
+    // Handle IPv4-mapped IPv6 in tcp6 (32 characters, e.g. 0000000000000000FFFF00006601A8C0)
+    if (len == 32) {
+        // If loopback ::1 (00000000000000000000000001000000)
+        if (strncmp(hex_ip, "00000000000000000000000001000000", 32) == 0) return true;
+        // If all zeroes (0000...0000)
+        if (strncmp(hex_ip, "00000000000000000000000000000000", 32) == 0) return true;
+
+        // If IPv4-mapped IPv6 (starts with 0000000000000000FFFF0000)
+        if (strncasecmp(hex_ip, "0000000000000000FFFF0000", 24) == 0) {
+            // Extract the last 8 hex characters which represent IPv4
+            hex_ip = hex_ip + 24;
+            len = 8;
+        } else {
+            // Check native IPv6 prefixes:
+            // fe80:: (Link-Local): in procfs words it matches "FE80" or little-endian "80FE"
+            if (strncasecmp(hex_ip, "FE80", 4) == 0 || strncasecmp(hex_ip + 4, "FE80", 4) == 0 ||
+                strncasecmp(hex_ip, "000080FE", 8) == 0) return true;
+            // fc00:: / fd00:: (ULA private)
+            if (strncasecmp(hex_ip, "FC", 2) == 0 || strncasecmp(hex_ip, "FD", 2) == 0 ||
+                strncasecmp(hex_ip + 6, "FC", 2) == 0 || strncasecmp(hex_ip + 6, "FD", 2) == 0) return true;
+            // ff00:: (Multicast)
+            if (strncasecmp(hex_ip, "FF", 2) == 0 || strncasecmp(hex_ip + 6, "FF", 2) == 0) return true;
+            return false;
+        }
+    }
+
+    // Standard 8-character IPv4 (e.g. 7001A8C0 for 192.168.1.112)
     unsigned int raw_ip = 0;
     if (sscanf(hex_ip, "%x", &raw_ip) != 1) return false;
 
     unsigned char b1 = raw_ip & 0xFF;
     unsigned char b2 = (raw_ip >> 8) & 0xFF;
-    unsigned char b3 = (raw_ip >> 16) & 0xFF;
-    unsigned char b4 = (raw_ip >> 24) & 0xFF;
-    (void)b3; (void)b4;
 
     // 127.0.0.0/8 (Loopback)
     if (b1 == 127) return true;
     // 10.0.0.0/8 (Private A)
     if (b1 == 10) return true;
-    // 192.168.0.0/16 (Private C / Local Wi-Fi)
+    // 192.168.0.0/16 (Private C / Local Wi-Fi & Hotspots)
     if (b1 == 192 && b2 == 168) return true;
     // 172.16.0.0/12 (Private B / Docker / Containers)
     if (b1 == 172 && (b2 >= 16 && b2 <= 31)) return true;
@@ -293,7 +318,7 @@ bool is_hex_ip_local(const char *hex_ip) {
     if (b1 == 169 && b2 == 254) return true;
     // 224.0.0.0/4 (Multicast / Broadcast / mDNS)
     if (b1 >= 224) return true;
-    // 0.0.0.0
+    // 0.0.0.0 (Unspecified)
     if (b1 == 0 && b2 == 0) return true;
 
     return false;
@@ -303,6 +328,7 @@ typedef struct {
     unsigned long inode;
     bool is_established;
     bool is_local;
+    unsigned int port;
     pid_t pid;
 } SocketEntry;
 
@@ -318,7 +344,7 @@ void init_socket_list(SocketList *list) {
     list->entries = malloc(list->capacity * sizeof(SocketEntry));
 }
 
-void add_socket(SocketList *list, unsigned long inode, bool is_est, bool is_local) {
+void add_socket(SocketList *list, unsigned long inode, bool is_est, bool is_local, unsigned int port) {
     if (!list->entries) return;
 
     if (list->count >= list->capacity) {
@@ -332,6 +358,7 @@ void add_socket(SocketList *list, unsigned long inode, bool is_est, bool is_loca
     list->entries[list->count].inode = inode;
     list->entries[list->count].is_established = is_est;
     list->entries[list->count].is_local = is_local;
+    list->entries[list->count].port = port;
     list->entries[list->count].pid = 0;
     list->count++;
 }
@@ -370,9 +397,21 @@ void parse_proc_net_file(const char *path, SocketList *list) {
                &dummy_d1, &dummy_d2, &inode);
 
         if (num_matched >= 11 && inode > 0) {
+            char *colon = strchr(rem_addr, ':');
+            unsigned int port = 0;
+            if (colon) {
+                *colon = '\0';
+                sscanf(colon + 1, "%x", &port);
+            }
+
             bool is_local = is_hex_ip_local(rem_addr);
+            // Also check standard local KDE Connect port 1716 (0x06B4)
+            if (port == 1716 || port == 5353) {
+                is_local = true;
+            }
+
             bool is_est = (state == 1);
-            add_socket(list, inode, is_est, is_local);
+            add_socket(list, inode, is_est, is_local, port);
         }
     }
 
@@ -505,6 +544,16 @@ PidSnapshot* get_or_create_pid(BandwidthTracker *tracker, pid_t pid) {
     return NULL;
 }
 
+// Check purely local discovery daemons (KDE Connect daemon, mDNS avahi)
+bool is_known_local_app(const char *comm) {
+    if (!comm) return false;
+    if (strcasecmp(comm, "kdeconnectd") == 0 ||
+        strcasecmp(comm, "avahi-daemon") == 0) {
+        return true;
+    }
+    return false;
+}
+
 void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_list) {
     for (size_t i = 0; i < tracker->pid_count; i++) {
         tracker->pids[i].seen = false;
@@ -550,9 +599,9 @@ void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_l
 
             unsigned long inode = 0;
             if (sscanf(link_target, "socket:[%lu]", &inode) == 1 && inode > 0) {
-                has_net = true;
                 for (size_t s = 0; s < sock_list->count; s++) {
                     if (sock_list->entries[s].inode == inode) {
+                        has_net = true;
                         if (sock_list->entries[s].is_established) {
                             has_active = true;
                         }
@@ -561,6 +610,7 @@ void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_l
                         } else {
                             remote_sockets++;
                         }
+                        break;
                     }
                 }
             }
@@ -573,7 +623,12 @@ void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_l
                 ps->seen = true;
                 ps->has_network_socket = true;
                 ps->has_active_stream = has_active;
-                ps->is_mostly_local = (local_sockets > 0 && remote_sockets == 0);
+
+                if (is_known_local_app(ps->comm) || (local_sockets > 0 && remote_sockets == 0)) {
+                    ps->is_mostly_local = true;
+                } else {
+                    ps->is_mostly_local = false;
+                }
 
                 unsigned long long rchar = 0, wchar = 0;
                 if (get_process_io_bytes(pid, &rchar, &wchar)) {
@@ -701,7 +756,6 @@ bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
     sqlite3_exec(database->db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
 
     for (size_t i = 0; i < tracker->count; i++) {
-        // 1. Insert WAN records (Internet / Quota)
         if (tracker->apps[i].wan_download > 0 || tracker->apps[i].wan_upload > 0) {
             sqlite3_reset(database->insert_stmt);
             sqlite3_clear_bindings(database->insert_stmt);
@@ -709,7 +763,7 @@ bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
             sqlite3_bind_text(database->insert_stmt, 1, tracker->apps[i].app_name, -1, SQLITE_STATIC);
             sqlite3_bind_int64(database->insert_stmt, 2, (sqlite3_int64)tracker->apps[i].wan_upload);
             sqlite3_bind_int64(database->insert_stmt, 3, (sqlite3_int64)tracker->apps[i].wan_download);
-            sqlite3_bind_int(database->insert_stmt, 4, 0); // is_local = 0 (WAN)
+            sqlite3_bind_int(database->insert_stmt, 4, 0);
 
             sqlite3_step(database->insert_stmt);
 
@@ -717,7 +771,6 @@ bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
             tracker->apps[i].wan_download = 0;
         }
 
-        // 2. Insert LAN records (Local Network)
         if (tracker->apps[i].lan_download > 0 || tracker->apps[i].lan_upload > 0) {
             sqlite3_reset(database->insert_stmt);
             sqlite3_clear_bindings(database->insert_stmt);
@@ -725,7 +778,7 @@ bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
             sqlite3_bind_text(database->insert_stmt, 1, tracker->apps[i].app_name, -1, SQLITE_STATIC);
             sqlite3_bind_int64(database->insert_stmt, 2, (sqlite3_int64)tracker->apps[i].lan_upload);
             sqlite3_bind_int64(database->insert_stmt, 3, (sqlite3_int64)tracker->apps[i].lan_download);
-            sqlite3_bind_int(database->insert_stmt, 4, 1); // is_local = 1 (LAN)
+            sqlite3_bind_int(database->insert_stmt, 4, 1);
 
             sqlite3_step(database->insert_stmt);
 
@@ -827,7 +880,6 @@ void query_database(Database *database, const CliOptions *opts) {
 
     const char *order_dir = opts->sort_asc ? "ASC" : "DESC";
 
-    // 1. Per-Application Summary Query
     snprintf(sql,
              sizeof(sql),
              "SELECT app_name, "
@@ -913,7 +965,6 @@ void query_database(Database *database, const CliOptions *opts) {
            "TOTAL AGGREGATED", total_up_str, total_down_str, grand_total_str, row_count);
     printf("---------------------------------------------------------------------------------------------------\n");
 
-    // 2. WAN vs LAN Breakdown Query (Executed in SQL)
     char split_sql[1024];
     snprintf(split_sql,
              sizeof(split_sql),
@@ -969,7 +1020,6 @@ void query_database(Database *database, const CliOptions *opts) {
     printf("===================================================================================================\n\n");
 }
 
-// Continuous Background Daemon Collector
 void run_daemon_collector(Database *db) {
     log_message(LOG_INFO, "NetMonitor continuous background collector started (DB: %s).", db->db_path);
 
