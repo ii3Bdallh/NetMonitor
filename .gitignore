@@ -1,0 +1,10 @@
+# Binaries and object files
+netmon
+*.o
+*.out
+
+# Editor and temporary files
+.vscode/
+.idea/
+*.swp
+*~
