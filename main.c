@@ -57,8 +57,8 @@ void get_database_path(char *dest, size_t maxlen, bool for_writing) {
     }
 
     if (for_writing) {
-        if (mkdir(SYSTEM_DB_DIR, 0777) == 0 || errno == EEXIST || access(SYSTEM_DB_DIR, W_OK) == 0) {
-            chmod(SYSTEM_DB_DIR, 0777);
+        if (mkdir(SYSTEM_DB_DIR, 0755) == 0 || errno == EEXIST || access(SYSTEM_DB_DIR, W_OK) == 0) {
+            chmod(SYSTEM_DB_DIR, 0755);
             snprintf(dest, maxlen, "%s", SYSTEM_DB_FILE);
             return;
         }
@@ -188,7 +188,7 @@ bool init_database(Database *database, bool for_writing) {
             return false;
         }
 
-        chmod(database->db_path, 0666);
+        chmod(database->db_path, 0664);
     }
 
     return true;
@@ -225,26 +225,36 @@ bool clear_database(Database *database) {
 // Network Interface & Sockets Collection
 // ==========================================
 typedef struct {
-    char name[32];
     unsigned long long rx_bytes;
     unsigned long long tx_bytes;
-} NetInterface;
+} TotalNetStats;
 
-bool get_active_interface_stats(NetInterface *iface) {
+bool is_ignored_interface(const char *name) {
+    if (!name) return true;
+    if (strcmp(name, "lo") == 0) return true;
+    // Exclude virtual docker bridges and veth endpoints to avoid double counting physical NICs
+    if (strncmp(name, "veth", 4) == 0) return true;
+    if (strncmp(name, "br-", 3) == 0) return true;
+    if (strcmp(name, "docker0") == 0) return true;
+    return false;
+}
+
+bool get_all_interfaces_stats(TotalNetStats *stats) {
     FILE *file = fopen(PROC_NET_DEV, "r");
     if (!file) {
         return false;
     }
 
     char line[BUFFER_SIZE];
-    bool found = false;
-    unsigned long long max_traffic = 0;
+    stats->rx_bytes = 0;
+    stats->tx_bytes = 0;
 
     if (fgets(line, sizeof(line), file) == NULL || fgets(line, sizeof(line), file) == NULL) {
         fclose(file);
         return false;
     }
 
+    bool found = false;
     while (fgets(line, sizeof(line), file)) {
         char if_name[32];
         unsigned long long rx = 0, tx = 0;
@@ -258,7 +268,7 @@ bool get_active_interface_stats(NetInterface *iface) {
         *colon = '\0';
         sscanf(line, "%s", if_name);
 
-        if (strcmp(if_name, "lo") == 0) {
+        if (is_ignored_interface(if_name)) {
             continue;
         }
 
@@ -268,14 +278,9 @@ bool get_active_interface_stats(NetInterface *iface) {
                             &tx);
 
         if (parsed >= 9) {
-            unsigned long long total = rx + tx;
-            if (total >= max_traffic) {
-                max_traffic = total;
-                snprintf(iface->name, sizeof(iface->name), "%s", if_name);
-                iface->rx_bytes = rx;
-                iface->tx_bytes = tx;
-                found = true;
-            }
+            stats->rx_bytes += rx;
+            stats->tx_bytes += tx;
+            found = true;
         }
     }
 
@@ -283,58 +288,86 @@ bool get_active_interface_stats(NetInterface *iface) {
     return found;
 }
 
-// Check if an IPv4 or IPv6 address belongs to private/local network (RFC 1918, link-local, loopback)
+// Check if an IPv4 or IPv6 address belongs to private/local network (RFC 1918, link-local, loopback, CGNAT)
 bool is_hex_ip_local(const char *hex_ip) {
     if (!hex_ip) return false;
     size_t len = strlen(hex_ip);
     if (len < 8) return false;
 
-    // Handle IPv4-mapped IPv6 in tcp6 (32 characters, e.g. 0000000000000000FFFF00006601A8C0)
+    // IPv6 Address (32 hex characters in /proc/net/tcp6: 4 words of 32-bit little-endian on x86)
     if (len == 32) {
-        // If loopback ::1 (00000000000000000000000001000000)
-        if (strncmp(hex_ip, "00000000000000000000000001000000", 32) == 0) return true;
-        // If all zeroes (0000...0000)
-        if (strncmp(hex_ip, "00000000000000000000000000000000", 32) == 0) return true;
+        unsigned char ip6[16];
+        for (int w = 0; w < 4; w++) {
+            unsigned int word = 0;
+            char word_str[9] = {0};
+            strncpy(word_str, hex_ip + (w * 8), 8);
+            if (sscanf(word_str, "%x", &word) != 1) return false;
+            // Reverse CPU endianness per 32-bit word to reconstruct 16-byte network order IPv6
+            ip6[w * 4 + 0] = (word >> 0) & 0xFF;
+            ip6[w * 4 + 1] = (word >> 8) & 0xFF;
+            ip6[w * 4 + 2] = (word >> 16) & 0xFF;
+            ip6[w * 4 + 3] = (word >> 24) & 0xFF;
+        }
 
-        // If IPv4-mapped IPv6 (starts with 0000000000000000FFFF0000)
-        if (strncasecmp(hex_ip, "0000000000000000FFFF0000", 24) == 0) {
-            // Extract the last 8 hex characters which represent IPv4
-            hex_ip = hex_ip + 24;
-            len = 8;
-        } else {
-            // Check native IPv6 prefixes:
-            // fe80:: (Link-Local): in procfs words it matches "FE80" or little-endian "80FE"
-            if (strncasecmp(hex_ip, "FE80", 4) == 0 || strncasecmp(hex_ip + 4, "FE80", 4) == 0 ||
-                strncasecmp(hex_ip, "000080FE", 8) == 0) return true;
-            // fc00:: / fd00:: (ULA private)
-            if (strncasecmp(hex_ip, "FC", 2) == 0 || strncasecmp(hex_ip, "FD", 2) == 0 ||
-                strncasecmp(hex_ip + 6, "FC", 2) == 0 || strncasecmp(hex_ip + 6, "FD", 2) == 0) return true;
-            // ff00:: (Multicast)
-            if (strncasecmp(hex_ip, "FF", 2) == 0 || strncasecmp(hex_ip + 6, "FF", 2) == 0) return true;
+        // 1. Unspecified :: (all zeros)
+        bool all_zero = true;
+        for (int i = 0; i < 16; i++) {
+            if (ip6[i] != 0) { all_zero = false; break; }
+        }
+        if (all_zero) return true;
+
+        // 2. Loopback ::1 (15 zeros + 0x01)
+        bool is_loopback = true;
+        for (int i = 0; i < 15; i++) {
+            if (ip6[i] != 0) { is_loopback = false; break; }
+        }
+        if (is_loopback && ip6[15] == 1) return true;
+
+        // 3. IPv4-mapped IPv6 (::ffff:w.x.y.z -> 10 zeros + 0xFF + 0xFF + 4 bytes IPv4)
+        bool is_v4_mapped = true;
+        for (int i = 0; i < 10; i++) {
+            if (ip6[i] != 0) { is_v4_mapped = false; break; }
+        }
+        if (is_v4_mapped && ip6[10] == 0xFF && ip6[11] == 0xFF) {
+            unsigned char b1 = ip6[12];
+            unsigned char b2 = ip6[13];
+            if (b1 == 127) return true; // Loopback
+            if (b1 == 10) return true;  // 10.0.0.0/8
+            if (b1 == 192 && b2 == 168) return true; // 192.168.0.0/16
+            if (b1 == 172 && (b2 >= 16 && b2 <= 31)) return true; // 172.16.0.0/12
+            if (b1 == 100 && (b2 >= 64 && b2 <= 127)) return true; // 100.64.0.0/10 (CGNAT / Tailscale)
+            if (b1 == 169 && b2 == 254) return true; // 169.254.0.0/16 Link-Local
+            if (b1 >= 224) return true; // Multicast
+            if (b1 == 0 && b2 == 0) return true;
             return false;
         }
+
+        // 4. fe80::/10 (Link-Local IPv6: 1111 1110 10xx xxxx)
+        if (ip6[0] == 0xFE && (ip6[1] & 0xC0) == 0x80) return true;
+
+        // 5. fc00::/7 (Unique Local Address - ULA private IPv6: fc00:: and fd00::)
+        if ((ip6[0] & 0xFE) == 0xFC) return true;
+
+        // 6. ff00::/8 (Multicast IPv6)
+        if (ip6[0] == 0xFF) return true;
+
+        return false;
     }
 
-    // Standard 8-character IPv4 (e.g. 7001A8C0 for 192.168.1.112)
+    // Standard 8-character IPv4 (little-endian 32-bit int in /proc/net/tcp)
     unsigned int raw_ip = 0;
     if (sscanf(hex_ip, "%x", &raw_ip) != 1) return false;
 
     unsigned char b1 = raw_ip & 0xFF;
     unsigned char b2 = (raw_ip >> 8) & 0xFF;
 
-    // 127.0.0.0/8 (Loopback)
     if (b1 == 127) return true;
-    // 10.0.0.0/8 (Private A)
     if (b1 == 10) return true;
-    // 192.168.0.0/16 (Private C / Local Wi-Fi & Hotspots)
     if (b1 == 192 && b2 == 168) return true;
-    // 172.16.0.0/12 (Private B / Docker / Containers)
     if (b1 == 172 && (b2 >= 16 && b2 <= 31)) return true;
-    // 169.254.0.0/16 (Link-Local)
+    if (b1 == 100 && (b2 >= 64 && b2 <= 127)) return true; // 100.64.0.0/10 (CGNAT / Tailscale)
     if (b1 == 169 && b2 == 254) return true;
-    // 224.0.0.0/4 (Multicast / Broadcast / mDNS)
     if (b1 >= 224) return true;
-    // 0.0.0.0 (Unspecified)
     if (b1 == 0 && b2 == 0) return true;
 
     return false;
@@ -493,7 +526,8 @@ typedef struct {
     unsigned long long delta_wchar;
     bool has_network_socket;
     bool has_active_stream;
-    bool is_mostly_local;
+    int local_sockets;
+    int remote_sockets;
     bool seen;
 } PidSnapshot;
 
@@ -553,7 +587,8 @@ PidSnapshot* get_or_create_pid(BandwidthTracker *tracker, pid_t pid) {
         tracker->pids[idx].delta_wchar = 0;
         tracker->pids[idx].has_network_socket = false;
         tracker->pids[idx].has_active_stream = false;
-        tracker->pids[idx].is_mostly_local = false;
+        tracker->pids[idx].local_sockets = 0;
+        tracker->pids[idx].remote_sockets = 0;
         tracker->pids[idx].seen = true;
         return &tracker->pids[idx];
     }
@@ -570,12 +605,20 @@ bool is_known_local_app(const char *comm) {
     return false;
 }
 
+double get_process_local_ratio(const PidSnapshot *ps) {
+    if (is_known_local_app(ps->comm)) return 1.0;
+    int total = ps->local_sockets + ps->remote_sockets;
+    if (total == 0) return 0.0;
+    return (double)ps->local_sockets / (double)total;
+}
+
 void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_list) {
     for (size_t i = 0; i < tracker->pid_count; i++) {
         tracker->pids[i].seen = false;
         tracker->pids[i].has_network_socket = false;
         tracker->pids[i].has_active_stream = false;
-        tracker->pids[i].is_mostly_local = false;
+        tracker->pids[i].local_sockets = 0;
+        tracker->pids[i].remote_sockets = 0;
         tracker->pids[i].delta_rchar = 0;
         tracker->pids[i].delta_wchar = 0;
     }
@@ -639,12 +682,8 @@ void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_l
                 ps->seen = true;
                 ps->has_network_socket = true;
                 ps->has_active_stream = has_active;
-
-                if (is_known_local_app(ps->comm) || (local_sockets > 0 && remote_sockets == 0)) {
-                    ps->is_mostly_local = true;
-                } else {
-                    ps->is_mostly_local = false;
-                }
+                ps->local_sockets = local_sockets;
+                ps->remote_sockets = remote_sockets;
 
                 unsigned long long rchar = 0, wchar = 0;
                 if (get_process_io_bytes(pid, &rchar, &wchar)) {
@@ -689,11 +728,11 @@ void attribute_bandwidth(BandwidthTracker *tracker, unsigned long long delta_rx,
                 if (share_rx > 0) {
                     AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
                     if (app) {
-                        if (tracker->pids[i].is_mostly_local) {
-                            app->lan_download += share_rx;
-                        } else {
-                            app->wan_download += share_rx;
-                        }
+                        double local_ratio = get_process_local_ratio(&tracker->pids[i]);
+                        unsigned long long lan_rx = (unsigned long long)(share_rx * local_ratio);
+                        unsigned long long wan_rx = share_rx - lan_rx;
+                        app->lan_download += lan_rx;
+                        app->wan_download += wan_rx;
                     }
                 }
             }
@@ -703,11 +742,11 @@ void attribute_bandwidth(BandwidthTracker *tracker, unsigned long long delta_rx,
                 if (tracker->pids[i].seen && tracker->pids[i].has_active_stream) {
                     AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
                     if (app) {
-                        if (tracker->pids[i].is_mostly_local) {
-                            app->lan_download += share_rx;
-                        } else {
-                            app->wan_download += share_rx;
-                        }
+                        double local_ratio = get_process_local_ratio(&tracker->pids[i]);
+                        unsigned long long lan_rx = (unsigned long long)(share_rx * local_ratio);
+                        unsigned long long wan_rx = share_rx - lan_rx;
+                        app->lan_download += lan_rx;
+                        app->wan_download += wan_rx;
                     }
                 }
             }
@@ -726,11 +765,11 @@ void attribute_bandwidth(BandwidthTracker *tracker, unsigned long long delta_rx,
                 if (share_tx > 0) {
                     AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
                     if (app) {
-                        if (tracker->pids[i].is_mostly_local) {
-                            app->lan_upload += share_tx;
-                        } else {
-                            app->wan_upload += share_tx;
-                        }
+                        double local_ratio = get_process_local_ratio(&tracker->pids[i]);
+                        unsigned long long lan_tx = (unsigned long long)(share_tx * local_ratio);
+                        unsigned long long wan_tx = share_tx - lan_tx;
+                        app->lan_upload += lan_tx;
+                        app->wan_upload += wan_tx;
                     }
                 }
             }
@@ -740,11 +779,11 @@ void attribute_bandwidth(BandwidthTracker *tracker, unsigned long long delta_rx,
                 if (tracker->pids[i].seen && tracker->pids[i].has_active_stream) {
                     AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
                     if (app) {
-                        if (tracker->pids[i].is_mostly_local) {
-                            app->lan_upload += share_tx;
-                        } else {
-                            app->wan_upload += share_tx;
-                        }
+                        double local_ratio = get_process_local_ratio(&tracker->pids[i]);
+                        unsigned long long lan_tx = (unsigned long long)(share_tx * local_ratio);
+                        unsigned long long wan_tx = share_tx - lan_tx;
+                        app->lan_upload += lan_tx;
+                        app->wan_upload += wan_tx;
                     }
                 }
             }
@@ -1046,26 +1085,26 @@ void run_daemon_collector(Database *db) {
     BandwidthTracker tracker;
     init_tracker(&tracker);
 
-    NetInterface prev_iface = {0};
-    bool has_prev = get_active_interface_stats(&prev_iface);
+    TotalNetStats prev_stats = {0};
+    bool has_prev = get_all_interfaces_stats(&prev_stats);
 
     time_t last_flush_time = time(NULL);
 
     while (keep_running) {
         sleep(1);
 
-        NetInterface curr_iface = {0};
-        bool has_curr = get_active_interface_stats(&curr_iface);
+        TotalNetStats curr_stats = {0};
+        bool has_curr = get_all_interfaces_stats(&curr_stats);
 
-        if (has_prev && has_curr && strcmp(prev_iface.name, curr_iface.name) == 0) {
+        if (has_prev && has_curr) {
             unsigned long long delta_rx = 0;
             unsigned long long delta_tx = 0;
 
-            if (curr_iface.rx_bytes >= prev_iface.rx_bytes) {
-                delta_rx = curr_iface.rx_bytes - prev_iface.rx_bytes;
+            if (curr_stats.rx_bytes >= prev_stats.rx_bytes) {
+                delta_rx = curr_stats.rx_bytes - prev_stats.rx_bytes;
             }
-            if (curr_iface.tx_bytes >= prev_iface.tx_bytes) {
-                delta_tx = curr_iface.tx_bytes - prev_iface.tx_bytes;
+            if (curr_stats.tx_bytes >= prev_stats.tx_bytes) {
+                delta_tx = curr_stats.tx_bytes - prev_stats.tx_bytes;
             }
 
             if (delta_rx > 0 || delta_tx > 0) {
@@ -1085,7 +1124,7 @@ void run_daemon_collector(Database *db) {
         }
 
         if (has_curr) {
-            prev_iface = curr_iface;
+            prev_stats = curr_stats;
             has_prev = true;
         }
 
