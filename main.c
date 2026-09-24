@@ -40,7 +40,6 @@ bool init_database(Database *database) {
         return false;
     }
 
-    // Optimize SQLite with WAL mode
     sqlite3_exec(database->db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
     sqlite3_exec(database->db, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
 
@@ -385,7 +384,6 @@ bool batch_insert_usage(Database *database, const ProcessNetUsage *procs, size_t
     return true;
 }
 
-// Helper to format bytes to human readable string
 void format_bytes(unsigned long long bytes, char *buffer, size_t buflen) {
     if (bytes >= 1024ULL * 1024ULL * 1024ULL) {
         snprintf(buffer, buflen, "%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
@@ -398,7 +396,6 @@ void format_bytes(unsigned long long bytes, char *buffer, size_t buflen) {
     }
 }
 
-// Parse human size strings like "200M", "1G", "500K", "1024"
 unsigned long long parse_size_string(const char *str) {
     if (!str) return 0;
 
@@ -422,13 +419,14 @@ unsigned long long parse_size_string(const char *str) {
 }
 
 // ==========================================
-// SQL Query & CLI Filter Handler (Stage 4)
+// SQL Query & CLI Filter Handler
 // ==========================================
 typedef struct {
     bool time_filter_active;
     char time_clause[128];
+    char time_description[128];
     unsigned long long min_bytes;
-    bool sort_asc; // false = DESC (default), true = ASC
+    bool sort_asc;
     bool run_daemon;
     bool record_snapshot;
 } CliOptions;
@@ -439,9 +437,11 @@ void print_help(const char *prog_name) {
     printf("=========================================================================\n");
     printf("Usage: %s [OPTIONS]\n\n", prog_name);
     printf("Time Filtering Options (Executed in SQL):\n");
-    printf("  -d, --last-day              Show usage records from the last 24 hours\n");
-    printf("  -w, --last-week             Show usage records from the last 7 days\n");
-    printf("  -m, --last-month            Show usage records from the last 30 days\n");
+    printf("  --last-minute [N]           Show usage from last N minutes (default N=1)\n");
+    printf("  --last-hour [N]             Show usage from last N hours   (default N=1)\n");
+    printf("  -d, --last-day [N]          Show usage from last N days    (default N=1)\n");
+    printf("  -w, --last-week [N]         Show usage from last N weeks   (default N=1)\n");
+    printf("  -m, --last-month [N]        Show usage from last N months  (default N=1)\n");
     printf("  -c, --custom \"YYYY-MM-DD\"   Filter records for a specific date\n\n");
     printf("Size Filtering & Sorting (Executed in SQL):\n");
     printf("      --min <SIZE>            Filter apps with traffic >= size (e.g., 200M, 1G, 500K)\n");
@@ -451,10 +451,12 @@ void print_help(const char *prog_name) {
     printf("      --daemon                Run continuous background collector (writes every 60s)\n");
     printf("  -h, --help                  Display this help message and exit\n\n");
     printf("Examples:\n");
-    printf("  %s --last-day --sort desc\n", prog_name);
-    printf("  %s --last-week --min 200M\n", prog_name);
+    printf("  %s --last-minute 30\n", prog_name);
+    printf("  %s --last-hour 9\n", prog_name);
+    printf("  %s --last-day 5 --sort desc\n", prog_name);
+    printf("  %s --last-week 4 --min 200M\n", prog_name);
+    printf("  %s --last-month 2\n", prog_name);
     printf("  %s --custom \"2026-09-24\" --sort asc\n", prog_name);
-    printf("  %s --min 500K\n", prog_name);
     printf("=========================================================================\n");
 }
 
@@ -463,20 +465,16 @@ void query_database(Database *database, const CliOptions *opts) {
     char where_clause[512] = "";
     char having_clause[256] = "";
 
-    // 1. Time Filter in SQL WHERE
     if (opts->time_filter_active && strlen(opts->time_clause) > 0) {
         snprintf(where_clause, sizeof(where_clause), "WHERE %s", opts->time_clause);
     }
 
-    // 2. Min Size Filter in SQL HAVING (aggregated per application)
     if (opts->min_bytes > 0) {
         snprintf(having_clause, sizeof(having_clause), "HAVING total_bytes >= %llu", opts->min_bytes);
     }
 
-    // 3. Sorting in SQL ORDER BY
     const char *order_dir = opts->sort_asc ? "ASC" : "DESC";
 
-    // Build the complete SQL query
     snprintf(sql, sizeof(sql),
              "SELECT app_name, "
              "       SUM(bytes_sent) AS total_sent, "
@@ -501,7 +499,7 @@ void query_database(Database *database, const CliOptions *opts) {
     printf("\n===================================================================================================\n");
     printf("                                   DATABASE QUERY RESULTS                                          \n");
     printf("===================================================================================================\n");
-    printf(" Filter  : %s\n", opts->time_filter_active ? opts->time_clause : "All Recorded Time");
+    printf(" Filter  : %s\n", opts->time_filter_active ? opts->time_description : "All Recorded Time");
     if (opts->min_bytes > 0) {
         char min_str[32];
         format_bytes(opts->min_bytes, min_str, sizeof(min_str));
@@ -610,6 +608,22 @@ void execute_collector(Database *db, bool daemon_mode) {
     } while (keep_running);
 }
 
+// Helper to extract optional numeric argument for flags like --last-day [N] or -d [N]
+int get_optional_numeric_arg(int argc, char *argv[]) {
+    if (optarg) {
+        int n = atoi(optarg);
+        return n > 0 ? n : 1;
+    }
+    if (optind < argc && argv[optind] && argv[optind][0] != '-') {
+        int n = atoi(argv[optind]);
+        if (n > 0) {
+            optind++;
+            return n;
+        }
+    }
+    return 1;
+}
+
 int main(int argc, char *argv[]) {
     signal(SIGINT, handle_sigint);
 
@@ -622,22 +636,32 @@ int main(int argc, char *argv[]) {
     CliOptions opts = {
         .time_filter_active = false,
         .time_clause = "",
+        .time_description = "",
         .min_bytes = 0,
         .sort_asc = false,
         .run_daemon = false,
         .record_snapshot = false
     };
 
+    enum {
+        OPT_LAST_MINUTE = 1000,
+        OPT_LAST_HOUR,
+        OPT_MIN_SIZE
+    };
+
     static struct option long_options[] = {
-        {"last-day",   no_argument,       0, 'd'},
-        {"last-week",  no_argument,       0, 'w'},
-        {"last-month", no_argument,       0, 'm'},
-        {"custom",     required_argument, 0, 'c'},
-        {"min",        required_argument, 0, 'M'},
-        {"sort",       required_argument, 0, 's'},
-        {"record",     no_argument,       0, 'r'},
-        {"daemon",     no_argument,       0, 'D'},
-        {"help",       no_argument,       0, 'h'},
+        {"last-minute", optional_argument, 0, OPT_LAST_MINUTE},
+        {"last-min",    optional_argument, 0, OPT_LAST_MINUTE},
+        {"last-hour",   optional_argument, 0, OPT_LAST_HOUR},
+        {"last-day",    optional_argument, 0, 'd'},
+        {"last-week",   optional_argument, 0, 'w'},
+        {"last-month",  optional_argument, 0, 'm'},
+        {"custom",      required_argument, 0, 'c'},
+        {"min",         required_argument, 0, OPT_MIN_SIZE},
+        {"sort",        required_argument, 0, 's'},
+        {"record",      no_argument,       0, 'r'},
+        {"daemon",      no_argument,       0, 'D'},
+        {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
@@ -645,35 +669,64 @@ int main(int argc, char *argv[]) {
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "dwmc:M:s:rDh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d::w::m::c:s:rDh", long_options, &option_index)) != -1) {
         switch (opt) {
-            case 'd': // --last-day
+            case OPT_LAST_MINUTE: {
+                int n = get_optional_numeric_arg(argc, argv);
                 opts.time_filter_active = true;
-                snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-1 day', 'localtime')");
+                snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d minutes', 'localtime')", n);
+                snprintf(opts.time_description, sizeof(opts.time_description), "Last %d Minute(s)", n);
                 has_query_flags = true;
                 break;
+            }
 
-            case 'w': // --last-week
+            case OPT_LAST_HOUR: {
+                int n = get_optional_numeric_arg(argc, argv);
                 opts.time_filter_active = true;
-                snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-7 days', 'localtime')");
+                snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d hours', 'localtime')", n);
+                snprintf(opts.time_description, sizeof(opts.time_description), "Last %d Hour(s)", n);
                 has_query_flags = true;
                 break;
+            }
 
-            case 'm': // --last-month
+            case 'd': { // --last-day [N]
+                int n = get_optional_numeric_arg(argc, argv);
                 opts.time_filter_active = true;
-                snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-30 days', 'localtime')");
+                snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d days', 'localtime')", n);
+                snprintf(opts.time_description, sizeof(opts.time_description), "Last %d Day(s)", n);
                 has_query_flags = true;
                 break;
+            }
+
+            case 'w': { // --last-week [N]
+                int n = get_optional_numeric_arg(argc, argv);
+                int days = n * 7;
+                opts.time_filter_active = true;
+                snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d days', 'localtime')", days);
+                snprintf(opts.time_description, sizeof(opts.time_description), "Last %d Week(s) (%d Days)", n, days);
+                has_query_flags = true;
+                break;
+            }
+
+            case 'm': { // --last-month [N]
+                int n = get_optional_numeric_arg(argc, argv);
+                opts.time_filter_active = true;
+                snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d months', 'localtime')", n);
+                snprintf(opts.time_description, sizeof(opts.time_description), "Last %d Month(s)", n);
+                has_query_flags = true;
+                break;
+            }
 
             case 'c': // --custom "YYYY-MM-DD"
                 if (optarg) {
                     opts.time_filter_active = true;
                     snprintf(opts.time_clause, sizeof(opts.time_clause), "date(timestamp) = date('%s')", optarg);
+                    snprintf(opts.time_description, sizeof(opts.time_description), "Custom Date: %s", optarg);
                     has_query_flags = true;
                 }
                 break;
 
-            case 'M': // --min <size>
+            case OPT_MIN_SIZE: // --min <size>
                 if (optarg) {
                     opts.min_bytes = parse_size_string(optarg);
                     has_query_flags = true;
@@ -720,7 +773,6 @@ int main(int argc, char *argv[]) {
     } else if (has_query_flags) {
         query_database(&db, &opts);
     } else {
-        // Default behavior when no arguments given: record current snapshot and show query summary
         execute_collector(&db, false);
         query_database(&db, &opts);
     }
