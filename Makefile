@@ -5,6 +5,7 @@ TARGET = netmon
 SERVICE_FILE = net_monitor.service
 INSTALL_BIN = /usr/local/bin
 INSTALL_SYSTEMD = /etc/systemd/system
+DATA_DIR = /var/lib/netmon
 
 all: $(TARGET)
 
@@ -20,11 +21,14 @@ $(TARGET): main.c sqlite3.o
 install: $(TARGET)
 	@echo "[*] Installing $(TARGET) to $(INSTALL_BIN)..."
 	@install -m 755 $(TARGET) $(INSTALL_BIN)/$(TARGET)
+	@echo "[*] Creating system data directory $(DATA_DIR)..."
+	@install -d -m 777 $(DATA_DIR)
+	@if [ -f usage.db ]; then cp -n usage.db $(DATA_DIR)/ 2>/dev/null || true; chmod 666 $(DATA_DIR)/usage.db* 2>/dev/null || true; fi
 	@echo "[*] Installing systemd service..."
 	@install -m 644 $(SERVICE_FILE) $(INSTALL_SYSTEMD)/$(SERVICE_FILE)
 	@systemctl daemon-reload
-	@systemctl enable --now $(SERVICE_FILE)
-	@echo "[✓] NetMonitor installed and running as a background service!"
+	@systemctl restart $(SERVICE_FILE)
+	@echo "[✓] NetMonitor installed and running globally!"
 
 uninstall:
 	@echo "[*] Stopping and disabling service..."

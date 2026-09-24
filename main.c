@@ -12,10 +12,12 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #include "sqlite3.h"
 
-#define DB_FILE "usage.db"
+#define SYSTEM_DB_DIR  "/var/lib/netmon"
+#define SYSTEM_DB_FILE "/var/lib/netmon/usage.db"
 #define PROC_NET_DEV "/proc/net/dev"
 #define BUFFER_SIZE 512
 #define BATCH_INTERVAL_SECONDS 60
@@ -28,7 +30,6 @@ void handle_signal(int sig) {
     keep_running = false;
 }
 
-// Unified logging (stdout in CLI mode, syslog in Daemon mode)
 void log_message(int priority, const char *format, ...) {
     va_list args;
     va_start(args, format);
@@ -48,6 +49,51 @@ void log_message(int priority, const char *format, ...) {
 }
 
 // ==========================================
+// Path Resolution (Global Fixed Location)
+// ==========================================
+void get_database_path(char *dest, size_t maxlen, bool for_writing) {
+    // 1. Primary global system location: /var/lib/netmon/usage.db
+    if (access(SYSTEM_DB_FILE, R_OK) == 0) {
+        snprintf(dest, maxlen, "%s", SYSTEM_DB_FILE);
+        return;
+    }
+
+    if (for_writing) {
+        // Create directory if running as root
+        if (mkdir(SYSTEM_DB_DIR, 0777) == 0 || errno == EEXIST || access(SYSTEM_DB_DIR, W_OK) == 0) {
+            chmod(SYSTEM_DB_DIR, 0777);
+            snprintf(dest, maxlen, "%s", SYSTEM_DB_FILE);
+            return;
+        }
+    }
+
+    // 2. User directory fallback: ~/.local/share/netmon/usage.db
+    const char *home = getenv("HOME");
+    if (home) {
+        char user_dir[256];
+        snprintf(user_dir, sizeof(user_dir), "%s/.local/share/netmon", home);
+        char user_db[512];
+        snprintf(user_db, sizeof(user_db), "%s/usage.db", user_dir);
+
+        if (access(user_db, R_OK) == 0) {
+            snprintf(dest, maxlen, "%s", user_db);
+            return;
+        }
+
+        if (for_writing) {
+            char cmd[600];
+            snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\"", user_dir);
+            system(cmd);
+            snprintf(dest, maxlen, "%s", user_db);
+            return;
+        }
+    }
+
+    // Default to system DB path
+    snprintf(dest, maxlen, "%s", SYSTEM_DB_FILE);
+}
+
+// ==========================================
 // Daemonization Process
 // ==========================================
 void daemonize(void) {
@@ -57,7 +103,6 @@ void daemonize(void) {
         exit(EXIT_FAILURE);
     }
     if (pid > 0) {
-        // Exit parent process
         exit(EXIT_SUCCESS);
     }
 
@@ -74,13 +119,11 @@ void daemonize(void) {
         exit(EXIT_FAILURE);
     }
     if (pid > 0) {
-        // Exit second parent
         exit(EXIT_SUCCESS);
     }
 
     umask(0);
 
-    // Redirect standard streams to /dev/null
     int dev_null = open("/dev/null", O_RDWR);
     if (dev_null != -1) {
         dup2(dev_null, STDIN_FILENO);
@@ -98,48 +141,64 @@ void daemonize(void) {
 typedef struct {
     sqlite3 *db;
     sqlite3_stmt *insert_stmt;
+    char db_path[512];
 } Database;
 
-bool init_database(Database *database) {
-    int rc = sqlite3_open(DB_FILE, &database->db);
+bool init_database(Database *database, bool for_writing) {
+    get_database_path(database->db_path, sizeof(database->db_path), for_writing);
+
+    int open_flags = for_writing ? (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) : SQLITE_OPEN_READONLY;
+    int rc = sqlite3_open_v2(database->db_path, &database->db, open_flags, NULL);
+
     if (rc != SQLITE_OK) {
-        log_message(LOG_ERR, "Cannot open database %s: %s", DB_FILE, sqlite3_errmsg(database->db));
+        // If read-only open failed, try regular open
+        rc = sqlite3_open(database->db_path, &database->db);
+    }
+
+    if (rc != SQLITE_OK) {
+        log_message(LOG_ERR, "Cannot open database at '%s': %s", database->db_path, sqlite3_errmsg(database->db));
         return false;
     }
 
-    sqlite3_exec(database->db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
-    sqlite3_exec(database->db, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
+    // If writing, configure WAL mode and schema
+    if (for_writing) {
+        sqlite3_exec(database->db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
+        sqlite3_exec(database->db, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
 
-    const char *create_table_sql =
-        "CREATE TABLE IF NOT EXISTS network_usage ("
-        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "  app_name TEXT NOT NULL,"
-        "  bytes_sent INTEGER NOT NULL DEFAULT 0,"
-        "  bytes_received INTEGER NOT NULL DEFAULT 0,"
-        "  timestamp DATETIME DEFAULT (datetime('now', 'localtime'))"
-        ");"
-        "CREATE INDEX IF NOT EXISTS idx_app_time ON network_usage(app_name, timestamp);";
+        const char *create_table_sql =
+            "CREATE TABLE IF NOT EXISTS network_usage ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  app_name TEXT NOT NULL,"
+            "  bytes_sent INTEGER NOT NULL DEFAULT 0,"
+            "  bytes_received INTEGER NOT NULL DEFAULT 0,"
+            "  timestamp DATETIME DEFAULT (datetime('now', 'localtime'))"
+            ");"
+            "CREATE INDEX IF NOT EXISTS idx_app_time ON network_usage(app_name, timestamp);";
 
-    char *err_msg = NULL;
-    rc = sqlite3_exec(database->db, create_table_sql, NULL, NULL, &err_msg);
-    if (rc != SQLITE_OK) {
-        log_message(LOG_ERR, "Failed to create database table: %s", err_msg);
-        sqlite3_free(err_msg);
-        sqlite3_close(database->db);
-        database->db = NULL;
-        return false;
-    }
+        char *err_msg = NULL;
+        rc = sqlite3_exec(database->db, create_table_sql, NULL, NULL, &err_msg);
+        if (rc != SQLITE_OK) {
+            log_message(LOG_ERR, "Failed to create database table: %s", err_msg);
+            sqlite3_free(err_msg);
+            sqlite3_close(database->db);
+            database->db = NULL;
+            return false;
+        }
 
-    const char *insert_sql =
-        "INSERT INTO network_usage (app_name, bytes_sent, bytes_received, timestamp) "
-        "VALUES (?, ?, ?, datetime('now', 'localtime'));";
+        const char *insert_sql =
+            "INSERT INTO network_usage (app_name, bytes_sent, bytes_received, timestamp) "
+            "VALUES (?, ?, ?, datetime('now', 'localtime'));";
 
-    rc = sqlite3_prepare_v2(database->db, insert_sql, -1, &database->insert_stmt, NULL);
-    if (rc != SQLITE_OK) {
-        log_message(LOG_ERR, "Failed to prepare insert statement: %s", sqlite3_errmsg(database->db));
-        sqlite3_close(database->db);
-        database->db = NULL;
-        return false;
+        rc = sqlite3_prepare_v2(database->db, insert_sql, -1, &database->insert_stmt, NULL);
+        if (rc != SQLITE_OK) {
+            log_message(LOG_ERR, "Failed to prepare insert statement: %s", sqlite3_errmsg(database->db));
+            sqlite3_close(database->db);
+            database->db = NULL;
+            return false;
+        }
+
+        // Grant read permissions to database files so all users can query
+        chmod(database->db_path, 0666);
     }
 
     return true;
@@ -523,7 +582,6 @@ void print_help(const char *prog_name) {
     printf("  %s --last-day 5 --sort desc\n", prog_name);
     printf("  %s --last-week 4 --min 200M\n", prog_name);
     printf("  %s --custom \"2026-09-24\" --sort asc\n", prog_name);
-    printf("  %s --daemon\n", prog_name);
     printf("=========================================================================\n");
 }
 
@@ -566,6 +624,7 @@ void query_database(Database *database, const CliOptions *opts) {
     printf("\n===================================================================================================\n");
     printf("                                   DATABASE QUERY RESULTS                                          \n");
     printf("===================================================================================================\n");
+    printf(" Database: %s\n", database->db_path);
     printf(" Filter  : %s\n", opts->time_filter_active ? opts->time_description : "All Recorded Time");
     if (opts->min_bytes > 0) {
         char min_str[32];
@@ -628,7 +687,7 @@ void query_database(Database *database, const CliOptions *opts) {
 void execute_collector(Database *db, bool daemon_mode) {
     time_t last_batch_time = 0;
 
-    log_message(LOG_INFO, "NetMonitor background collector started.");
+    log_message(LOG_INFO, "NetMonitor background collector started (DB: %s).", db->db_path);
 
     do {
         NetInterface active_iface;
@@ -670,7 +729,7 @@ void execute_collector(Database *db, bool daemon_mode) {
                 printf(" Total Upload     : %8.2f MB\n", tx_mb);
                 printf(" Total Traffic    : %8.2f MB\n", rx_mb + tx_mb);
             }
-            printf(" [DB Status] Saved %d active application records into %s\n\n", proc_count, DB_FILE);
+            printf(" [DB Status] Saved %d active application records into %s\n\n", proc_count, db->db_path);
             free_socket_list(&sock_list);
             break;
         }
@@ -840,7 +899,8 @@ int main(int argc, char *argv[]) {
     }
 
     Database db = {0};
-    if (!init_database(&db)) {
+    bool for_writing = (opts.run_daemon || opts.record_snapshot || (!has_query_flags));
+    if (!init_database(&db, for_writing)) {
         if (is_daemon_mode) closelog();
         return 1;
     }
