@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <time.h>
+#include <getopt.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -39,7 +40,7 @@ bool init_database(Database *database) {
         return false;
     }
 
-    // Optimize SQLite for high-throughput, non-blocking operations (WAL Mode)
+    // Optimize SQLite with WAL mode
     sqlite3_exec(database->db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
     sqlite3_exec(database->db, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
 
@@ -90,7 +91,7 @@ void close_database(Database *database) {
 }
 
 // ==========================================
-// Network Interface & Sockets
+// Network Interface & Sockets Collection
 // ==========================================
 typedef struct {
     char name[32];
@@ -312,9 +313,6 @@ void scan_proc_fds(SocketList *list) {
     closedir(proc_dir);
 }
 
-// ==========================================
-// Aggregation & Batch Insert
-// ==========================================
 typedef struct {
     pid_t pid;
     char comm[64];
@@ -365,15 +363,11 @@ int aggregate_process_usage(const SocketList *list, ProcessNetUsage *procs, size
     return (int)proc_count;
 }
 
-/**
- * Perform an ultra-fast, atomic Batch Insert into SQLite using a Transaction
- */
 bool batch_insert_usage(Database *database, const ProcessNetUsage *procs, size_t count) {
     if (!database->db || !database->insert_stmt || count == 0) {
         return false;
     }
 
-    // Begin transaction for high speed batch write without disk locking delays
     sqlite3_exec(database->db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
 
     for (size_t i = 0; i < count; i++) {
@@ -391,61 +385,182 @@ bool batch_insert_usage(Database *database, const ProcessNetUsage *procs, size_t
     return true;
 }
 
-int compare_proc_usage(const void *a, const void *b) {
-    const ProcessNetUsage *p1 = (const ProcessNetUsage *)a;
-    const ProcessNetUsage *p2 = (const ProcessNetUsage *)b;
-    int total_sockets_1 = p1->tcp_sockets + p1->udp_sockets;
-    int total_sockets_2 = p2->tcp_sockets + p2->udp_sockets;
-    return total_sockets_2 - total_sockets_1;
+// Helper to format bytes to human readable string
+void format_bytes(unsigned long long bytes, char *buffer, size_t buflen) {
+    if (bytes >= 1024ULL * 1024ULL * 1024ULL) {
+        snprintf(buffer, buflen, "%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+    } else if (bytes >= 1024ULL * 1024ULL) {
+        snprintf(buffer, buflen, "%.2f MB", (double)bytes / (1024.0 * 1024.0));
+    } else if (bytes >= 1024ULL) {
+        snprintf(buffer, buflen, "%.2f KB", (double)bytes / 1024.0);
+    } else {
+        snprintf(buffer, buflen, "%llu B", bytes);
+    }
 }
 
-void print_snapshot_report(const NetInterface *iface, const ProcessNetUsage *procs, size_t proc_count) {
-    printf("=========================================================================\n");
-    printf("     Network Usage Monitor - Stage 3 (SQLite Database Enabled)          \n");
-    printf("=========================================================================\n");
+// Parse human size strings like "200M", "1G", "500K", "1024"
+unsigned long long parse_size_string(const char *str) {
+    if (!str) return 0;
 
-    if (iface) {
-        double rx_mb = (double)iface->rx_bytes / (1024.0 * 1024.0);
-        double tx_mb = (double)iface->tx_bytes / (1024.0 * 1024.0);
-        double total_mb = rx_mb + tx_mb;
+    char *endptr = NULL;
+    double val = strtod(str, &endptr);
+    if (val < 0) val = 0;
 
-        printf(" Active Interface : %s\n", iface->name);
-        printf(" Total Download   : %8.2f MB\n", rx_mb);
-        printf(" Total Upload     : %8.2f MB\n", tx_mb);
-        printf(" Total Traffic    : %8.2f MB\n", total_mb);
+    if (endptr && *endptr != '\0') {
+        char unit = toupper((unsigned char)*endptr);
+        if (unit == 'K') {
+            return (unsigned long long)(val * 1024.0);
+        } else if (unit == 'M') {
+            return (unsigned long long)(val * 1024.0 * 1024.0);
+        } else if (unit == 'G') {
+            return (unsigned long long)(val * 1024.0 * 1024.0 * 1024.0);
+        } else if (unit == 'T') {
+            return (unsigned long long)(val * 1024.0 * 1024.0 * 1024.0 * 1024.0);
+        }
     }
-
-    printf("\n%-8s %-22s %-12s %-12s %-15s\n", "PID", "APPLICATION", "TCP SOCKETS", "UDP SOCKETS", "QUEUED (RX/TX)");
-    printf("-------------------------------------------------------------------------\n");
-
-    size_t max_display = proc_count < 15 ? proc_count : 15;
-    for (size_t i = 0; i < max_display; i++) {
-        printf("%-8d %-22s %-12d %-12d %llu / %llu B\n",
-               procs[i].pid,
-               procs[i].comm,
-               procs[i].tcp_sockets,
-               procs[i].udp_sockets,
-               procs[i].total_rx_queue,
-               procs[i].total_tx_queue);
-    }
-
-    if (proc_count == 0) {
-        printf("  No active socket associations found.\n");
-    }
-    printf("-------------------------------------------------------------------------\n");
+    return (unsigned long long)val;
 }
 
-int main(int argc, char *argv[]) {
-    signal(SIGINT, handle_sigint);
+// ==========================================
+// SQL Query & CLI Filter Handler (Stage 4)
+// ==========================================
+typedef struct {
+    bool time_filter_active;
+    char time_clause[128];
+    unsigned long long min_bytes;
+    bool sort_asc; // false = DESC (default), true = ASC
+    bool run_daemon;
+    bool record_snapshot;
+} CliOptions;
 
-    Database db = {0};
-    if (!init_database(&db)) {
-        fprintf(stderr, "Failed to initialize SQLite database. Exiting.\n");
-        return 1;
+void print_help(const char *prog_name) {
+    printf("=========================================================================\n");
+    printf("     Network Usage Monitor - Command Line Interface (CLI)                \n");
+    printf("=========================================================================\n");
+    printf("Usage: %s [OPTIONS]\n\n", prog_name);
+    printf("Time Filtering Options (Executed in SQL):\n");
+    printf("  -d, --last-day              Show usage records from the last 24 hours\n");
+    printf("  -w, --last-week             Show usage records from the last 7 days\n");
+    printf("  -m, --last-month            Show usage records from the last 30 days\n");
+    printf("  -c, --custom \"YYYY-MM-DD\"   Filter records for a specific date\n\n");
+    printf("Size Filtering & Sorting (Executed in SQL):\n");
+    printf("      --min <SIZE>            Filter apps with traffic >= size (e.g., 200M, 1G, 500K)\n");
+    printf("  -s, --sort <asc|desc>       Sort results by total consumption (default: desc)\n\n");
+    printf("Recording / Execution Modes:\n");
+    printf("      --record                Capture a live snapshot & record into database\n");
+    printf("      --daemon                Run continuous background collector (writes every 60s)\n");
+    printf("  -h, --help                  Display this help message and exit\n\n");
+    printf("Examples:\n");
+    printf("  %s --last-day --sort desc\n", prog_name);
+    printf("  %s --last-week --min 200M\n", prog_name);
+    printf("  %s --custom \"2026-09-24\" --sort asc\n", prog_name);
+    printf("  %s --min 500K\n", prog_name);
+    printf("=========================================================================\n");
+}
+
+void query_database(Database *database, const CliOptions *opts) {
+    char sql[1024];
+    char where_clause[512] = "";
+    char having_clause[256] = "";
+
+    // 1. Time Filter in SQL WHERE
+    if (opts->time_filter_active && strlen(opts->time_clause) > 0) {
+        snprintf(where_clause, sizeof(where_clause), "WHERE %s", opts->time_clause);
     }
 
-    bool daemon_mode = (argc > 1 && strcmp(argv[1], "--daemon") == 0);
+    // 2. Min Size Filter in SQL HAVING (aggregated per application)
+    if (opts->min_bytes > 0) {
+        snprintf(having_clause, sizeof(having_clause), "HAVING total_bytes >= %llu", opts->min_bytes);
+    }
 
+    // 3. Sorting in SQL ORDER BY
+    const char *order_dir = opts->sort_asc ? "ASC" : "DESC";
+
+    // Build the complete SQL query
+    snprintf(sql, sizeof(sql),
+             "SELECT app_name, "
+             "       SUM(bytes_sent) AS total_sent, "
+             "       SUM(bytes_received) AS total_recv, "
+             "       SUM(bytes_sent + bytes_received) AS total_bytes, "
+             "       COUNT(*) AS entries_count, "
+             "       MAX(timestamp) AS last_seen "
+             "FROM network_usage "
+             "%s "
+             "GROUP BY app_name "
+             "%s "
+             "ORDER BY total_bytes %s, app_name ASC;",
+             where_clause, having_clause, order_dir);
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(database->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[SQLite Query Error] Failed to execute query: %s\n", sqlite3_errmsg(database->db));
+        return;
+    }
+
+    printf("\n===================================================================================================\n");
+    printf("                                   DATABASE QUERY RESULTS                                          \n");
+    printf("===================================================================================================\n");
+    printf(" Filter  : %s\n", opts->time_filter_active ? opts->time_clause : "All Recorded Time");
+    if (opts->min_bytes > 0) {
+        char min_str[32];
+        format_bytes(opts->min_bytes, min_str, sizeof(min_str));
+        printf(" Min Size: >= %s\n", min_str);
+    }
+    printf(" Sort    : Total Bytes %s\n", order_dir);
+    printf("---------------------------------------------------------------------------------------------------\n");
+    printf("%-24s %-16s %-16s %-16s %-10s %-20s\n",
+           "APPLICATION", "SENT (TX)", "RECEIVED (RX)", "TOTAL USAGE", "SAMPLES", "LAST SEEN");
+    printf("---------------------------------------------------------------------------------------------------\n");
+
+    int row_count = 0;
+    unsigned long long grand_total_sent = 0;
+    unsigned long long grand_total_recv = 0;
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char *app = sqlite3_column_text(stmt, 0);
+        unsigned long long sent = (unsigned long long)sqlite3_column_int64(stmt, 1);
+        unsigned long long recv = (unsigned long long)sqlite3_column_int64(stmt, 2);
+        unsigned long long total = (unsigned long long)sqlite3_column_int64(stmt, 3);
+        int samples = sqlite3_column_int(stmt, 4);
+        const unsigned char *last_seen = sqlite3_column_text(stmt, 5);
+
+        char sent_str[32], recv_str[32], total_str[32];
+        format_bytes(sent, sent_str, sizeof(sent_str));
+        format_bytes(recv, recv_str, sizeof(recv_str));
+        format_bytes(total, total_str, sizeof(total_str));
+
+        printf("%-24s %-16s %-16s %-16s %-10d %-20s\n",
+               app ? (const char *)app : "[unknown]",
+               sent_str,
+               recv_str,
+               total_str,
+               samples,
+               last_seen ? (const char *)last_seen : "-");
+
+        grand_total_sent += sent;
+        grand_total_recv += recv;
+        row_count++;
+    }
+
+    if (row_count == 0) {
+        printf("  No matching records found in database for the given criteria.\n");
+    } else {
+        printf("---------------------------------------------------------------------------------------------------\n");
+        char total_sent_str[32], total_recv_str[32], grand_total_str[32];
+        format_bytes(grand_total_sent, total_sent_str, sizeof(total_sent_str));
+        format_bytes(grand_total_recv, total_recv_str, sizeof(total_recv_str));
+        format_bytes(grand_total_sent + grand_total_recv, grand_total_str, sizeof(grand_total_str));
+
+        printf("%-24s %-16s %-16s %-16s Total Rows: %d\n",
+               "TOTAL AGGREGATED", total_sent_str, total_recv_str, grand_total_str, row_count);
+    }
+    printf("===================================================================================================\n\n");
+
+    sqlite3_finalize(stmt);
+}
+
+void execute_collector(Database *db, bool daemon_mode) {
     time_t last_batch_time = 0;
 
     do {
@@ -465,20 +580,27 @@ int main(int argc, char *argv[]) {
         ProcessNetUsage procs[512];
         int proc_count = aggregate_process_usage(&sock_list, procs, 512);
 
-        qsort(procs, proc_count, sizeof(ProcessNetUsage), compare_proc_usage);
-
         time_t now = time(NULL);
 
-        // Always save batch in snapshot mode, or every BATCH_INTERVAL_SECONDS in daemon mode
         if (!daemon_mode || (now - last_batch_time >= BATCH_INTERVAL_SECONDS)) {
-            if (batch_insert_usage(&db, procs, proc_count)) {
+            if (batch_insert_usage(db, procs, proc_count)) {
                 last_batch_time = now;
             }
         }
 
         if (!daemon_mode) {
-            print_snapshot_report(has_iface ? &active_iface : NULL, procs, proc_count);
-            printf(" [DB Status] Successfully saved %d application records to %s\n\n", proc_count, DB_FILE);
+            printf("=========================================================================\n");
+            printf("     Network Usage Monitor - Snapshot Recorded to DB                    \n");
+            printf("=========================================================================\n");
+            if (has_iface) {
+                double rx_mb = (double)active_iface.rx_bytes / (1024.0 * 1024.0);
+                double tx_mb = (double)active_iface.tx_bytes / (1024.0 * 1024.0);
+                printf(" Active Interface : %s\n", active_iface.name);
+                printf(" Total Download   : %8.2f MB\n", rx_mb);
+                printf(" Total Upload     : %8.2f MB\n", tx_mb);
+                printf(" Total Traffic    : %8.2f MB\n", rx_mb + tx_mb);
+            }
+            printf(" [DB Status] Saved %d active application records into %s\n\n", proc_count, DB_FILE);
             free_socket_list(&sock_list);
             break;
         }
@@ -486,6 +608,122 @@ int main(int argc, char *argv[]) {
         free_socket_list(&sock_list);
         sleep(1);
     } while (keep_running);
+}
+
+int main(int argc, char *argv[]) {
+    signal(SIGINT, handle_sigint);
+
+    Database db = {0};
+    if (!init_database(&db)) {
+        fprintf(stderr, "Failed to initialize SQLite database. Exiting.\n");
+        return 1;
+    }
+
+    CliOptions opts = {
+        .time_filter_active = false,
+        .time_clause = "",
+        .min_bytes = 0,
+        .sort_asc = false,
+        .run_daemon = false,
+        .record_snapshot = false
+    };
+
+    static struct option long_options[] = {
+        {"last-day",   no_argument,       0, 'd'},
+        {"last-week",  no_argument,       0, 'w'},
+        {"last-month", no_argument,       0, 'm'},
+        {"custom",     required_argument, 0, 'c'},
+        {"min",        required_argument, 0, 'M'},
+        {"sort",       required_argument, 0, 's'},
+        {"record",     no_argument,       0, 'r'},
+        {"daemon",     no_argument,       0, 'D'},
+        {"help",       no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    bool has_query_flags = false;
+    int opt;
+    int option_index = 0;
+
+    while ((opt = getopt_long(argc, argv, "dwmc:M:s:rDh", long_options, &option_index)) != -1) {
+        switch (opt) {
+            case 'd': // --last-day
+                opts.time_filter_active = true;
+                snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-1 day', 'localtime')");
+                has_query_flags = true;
+                break;
+
+            case 'w': // --last-week
+                opts.time_filter_active = true;
+                snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-7 days', 'localtime')");
+                has_query_flags = true;
+                break;
+
+            case 'm': // --last-month
+                opts.time_filter_active = true;
+                snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-30 days', 'localtime')");
+                has_query_flags = true;
+                break;
+
+            case 'c': // --custom "YYYY-MM-DD"
+                if (optarg) {
+                    opts.time_filter_active = true;
+                    snprintf(opts.time_clause, sizeof(opts.time_clause), "date(timestamp) = date('%s')", optarg);
+                    has_query_flags = true;
+                }
+                break;
+
+            case 'M': // --min <size>
+                if (optarg) {
+                    opts.min_bytes = parse_size_string(optarg);
+                    has_query_flags = true;
+                }
+                break;
+
+            case 's': // --sort asc|desc
+                if (optarg) {
+                    if (strcasecmp(optarg, "asc") == 0) {
+                        opts.sort_asc = true;
+                    } else if (strcasecmp(optarg, "desc") == 0) {
+                        opts.sort_asc = false;
+                    } else {
+                        fprintf(stderr, "Invalid sort option '%s'. Use 'asc' or 'desc'.\n", optarg);
+                        close_database(&db);
+                        return 1;
+                    }
+                    has_query_flags = true;
+                }
+                break;
+
+            case 'r': // --record
+                opts.record_snapshot = true;
+                break;
+
+            case 'D': // --daemon
+                opts.run_daemon = true;
+                break;
+
+            case 'h': // --help
+                print_help(argv[0]);
+                close_database(&db);
+                return 0;
+
+            default:
+                print_help(argv[0]);
+                close_database(&db);
+                return 1;
+        }
+    }
+
+    if (opts.run_daemon || opts.record_snapshot) {
+        execute_collector(&db, opts.run_daemon);
+    } else if (has_query_flags) {
+        query_database(&db, &opts);
+    } else {
+        // Default behavior when no arguments given: record current snapshot and show query summary
+        execute_collector(&db, false);
+        query_database(&db, &opts);
+    }
 
     close_database(&db);
     return 0;
