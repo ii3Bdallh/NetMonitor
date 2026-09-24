@@ -8,6 +8,8 @@
 #include <ctype.h>
 #include <time.h>
 #include <getopt.h>
+#include <syslog.h>
+#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -19,10 +21,75 @@
 #define BATCH_INTERVAL_SECONDS 60
 
 static volatile bool keep_running = true;
+static bool is_daemon_mode = false;
 
-void handle_sigint(int sig) {
+void handle_signal(int sig) {
     (void)sig;
     keep_running = false;
+}
+
+// Unified logging (stdout in CLI mode, syslog in Daemon mode)
+void log_message(int priority, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    if (is_daemon_mode) {
+        vsyslog(priority, format, args);
+    } else {
+        if (priority == LOG_ERR) {
+            fprintf(stderr, "[ERROR] ");
+            vfprintf(stderr, format, args);
+            fprintf(stderr, "\n");
+        } else {
+            vprintf(format, args);
+            printf("\n");
+        }
+    }
+    va_end(args);
+}
+
+// ==========================================
+// Daemonization Process
+// ==========================================
+void daemonize(void) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_message(LOG_ERR, "First fork failed during daemonization.");
+        exit(EXIT_FAILURE);
+    }
+    if (pid > 0) {
+        // Exit parent process
+        exit(EXIT_SUCCESS);
+    }
+
+    if (setsid() < 0) {
+        log_message(LOG_ERR, "setsid failed during daemonization.");
+        exit(EXIT_FAILURE);
+    }
+
+    signal(SIGHUP, SIG_IGN);
+
+    pid = fork();
+    if (pid < 0) {
+        log_message(LOG_ERR, "Second fork failed during daemonization.");
+        exit(EXIT_FAILURE);
+    }
+    if (pid > 0) {
+        // Exit second parent
+        exit(EXIT_SUCCESS);
+    }
+
+    umask(0);
+
+    // Redirect standard streams to /dev/null
+    int dev_null = open("/dev/null", O_RDWR);
+    if (dev_null != -1) {
+        dup2(dev_null, STDIN_FILENO);
+        dup2(dev_null, STDOUT_FILENO);
+        dup2(dev_null, STDERR_FILENO);
+        if (dev_null > STDERR_FILENO) {
+            close(dev_null);
+        }
+    }
 }
 
 // ==========================================
@@ -36,7 +103,7 @@ typedef struct {
 bool init_database(Database *database) {
     int rc = sqlite3_open(DB_FILE, &database->db);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "[SQLite Error] Cannot open database %s: %s\n", DB_FILE, sqlite3_errmsg(database->db));
+        log_message(LOG_ERR, "Cannot open database %s: %s", DB_FILE, sqlite3_errmsg(database->db));
         return false;
     }
 
@@ -56,7 +123,7 @@ bool init_database(Database *database) {
     char *err_msg = NULL;
     rc = sqlite3_exec(database->db, create_table_sql, NULL, NULL, &err_msg);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "[SQLite Error] Failed to create table: %s\n", err_msg);
+        log_message(LOG_ERR, "Failed to create database table: %s", err_msg);
         sqlite3_free(err_msg);
         sqlite3_close(database->db);
         database->db = NULL;
@@ -69,7 +136,7 @@ bool init_database(Database *database) {
 
     rc = sqlite3_prepare_v2(database->db, insert_sql, -1, &database->insert_stmt, NULL);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "[SQLite Error] Failed to prepare insert statement: %s\n", sqlite3_errmsg(database->db));
+        log_message(LOG_ERR, "Failed to prepare insert statement: %s", sqlite3_errmsg(database->db));
         sqlite3_close(database->db);
         database->db = NULL;
         return false;
@@ -390,7 +457,7 @@ void format_bytes(unsigned long long bytes, char *buffer, size_t buflen) {
     } else if (bytes >= 1024ULL * 1024ULL) {
         snprintf(buffer, buflen, "%.2f MB", (double)bytes / (1024.0 * 1024.0));
     } else if (bytes >= 1024ULL) {
-        snprintf(buffer, buflen, "%.2f KB", (double)bytes / 1024.0);
+        snprintf(buffer, buflen, "%.2f KB", (double)bytes / (1024.0));
     } else {
         snprintf(buffer, buflen, "%llu B", bytes);
     }
@@ -446,17 +513,17 @@ void print_help(const char *prog_name) {
     printf("Size Filtering & Sorting (Executed in SQL):\n");
     printf("      --min <SIZE>            Filter apps with traffic >= size (e.g., 200M, 1G, 500K)\n");
     printf("  -s, --sort <asc|desc>       Sort results by total consumption (default: desc)\n\n");
-    printf("Recording / Execution Modes:\n");
+    printf("Daemon & Execution Modes:\n");
+    printf("  -D, --daemon                Run as background daemon service (logs to syslog)\n");
     printf("      --record                Capture a live snapshot & record into database\n");
-    printf("      --daemon                Run continuous background collector (writes every 60s)\n");
     printf("  -h, --help                  Display this help message and exit\n\n");
     printf("Examples:\n");
     printf("  %s --last-minute 30\n", prog_name);
     printf("  %s --last-hour 9\n", prog_name);
     printf("  %s --last-day 5 --sort desc\n", prog_name);
     printf("  %s --last-week 4 --min 200M\n", prog_name);
-    printf("  %s --last-month 2\n", prog_name);
     printf("  %s --custom \"2026-09-24\" --sort asc\n", prog_name);
+    printf("  %s --daemon\n", prog_name);
     printf("=========================================================================\n");
 }
 
@@ -492,7 +559,7 @@ void query_database(Database *database, const CliOptions *opts) {
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(database->db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "[SQLite Query Error] Failed to execute query: %s\n", sqlite3_errmsg(database->db));
+        log_message(LOG_ERR, "Failed to execute database query: %s", sqlite3_errmsg(database->db));
         return;
     }
 
@@ -561,6 +628,8 @@ void query_database(Database *database, const CliOptions *opts) {
 void execute_collector(Database *db, bool daemon_mode) {
     time_t last_batch_time = 0;
 
+    log_message(LOG_INFO, "NetMonitor background collector started.");
+
     do {
         NetInterface active_iface;
         bool has_iface = get_active_interface_stats(&active_iface);
@@ -583,6 +652,9 @@ void execute_collector(Database *db, bool daemon_mode) {
         if (!daemon_mode || (now - last_batch_time >= BATCH_INTERVAL_SECONDS)) {
             if (batch_insert_usage(db, procs, proc_count)) {
                 last_batch_time = now;
+                if (daemon_mode) {
+                    log_message(LOG_INFO, "Saved batch with %d active process records to SQLite.", proc_count);
+                }
             }
         }
 
@@ -606,9 +678,10 @@ void execute_collector(Database *db, bool daemon_mode) {
         free_socket_list(&sock_list);
         sleep(1);
     } while (keep_running);
+
+    log_message(LOG_INFO, "NetMonitor background collector stopped gracefully.");
 }
 
-// Helper to extract optional numeric argument for flags like --last-day [N] or -d [N]
 int get_optional_numeric_arg(int argc, char *argv[]) {
     if (optarg) {
         int n = atoi(optarg);
@@ -625,13 +698,8 @@ int get_optional_numeric_arg(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
-    signal(SIGINT, handle_sigint);
-
-    Database db = {0};
-    if (!init_database(&db)) {
-        fprintf(stderr, "Failed to initialize SQLite database. Exiting.\n");
-        return 1;
-    }
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
 
     CliOptions opts = {
         .time_filter_active = false,
@@ -689,7 +757,7 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
-            case 'd': { // --last-day [N]
+            case 'd': {
                 int n = get_optional_numeric_arg(argc, argv);
                 opts.time_filter_active = true;
                 snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d days', 'localtime')", n);
@@ -698,7 +766,7 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
-            case 'w': { // --last-week [N]
+            case 'w': {
                 int n = get_optional_numeric_arg(argc, argv);
                 int days = n * 7;
                 opts.time_filter_active = true;
@@ -708,7 +776,7 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
-            case 'm': { // --last-month [N]
+            case 'm': {
                 int n = get_optional_numeric_arg(argc, argv);
                 opts.time_filter_active = true;
                 snprintf(opts.time_clause, sizeof(opts.time_clause), "timestamp >= datetime('now', '-%d months', 'localtime')", n);
@@ -717,7 +785,7 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
-            case 'c': // --custom "YYYY-MM-DD"
+            case 'c':
                 if (optarg) {
                     opts.time_filter_active = true;
                     snprintf(opts.time_clause, sizeof(opts.time_clause), "date(timestamp) = date('%s')", optarg);
@@ -726,14 +794,14 @@ int main(int argc, char *argv[]) {
                 }
                 break;
 
-            case OPT_MIN_SIZE: // --min <size>
+            case OPT_MIN_SIZE:
                 if (optarg) {
                     opts.min_bytes = parse_size_string(optarg);
                     has_query_flags = true;
                 }
                 break;
 
-            case 's': // --sort asc|desc
+            case 's':
                 if (optarg) {
                     if (strcasecmp(optarg, "asc") == 0) {
                         opts.sort_asc = true;
@@ -741,31 +809,40 @@ int main(int argc, char *argv[]) {
                         opts.sort_asc = false;
                     } else {
                         fprintf(stderr, "Invalid sort option '%s'. Use 'asc' or 'desc'.\n", optarg);
-                        close_database(&db);
                         return 1;
                     }
                     has_query_flags = true;
                 }
                 break;
 
-            case 'r': // --record
+            case 'r':
                 opts.record_snapshot = true;
                 break;
 
-            case 'D': // --daemon
+            case 'D':
                 opts.run_daemon = true;
                 break;
 
-            case 'h': // --help
+            case 'h':
                 print_help(argv[0]);
-                close_database(&db);
                 return 0;
 
             default:
                 print_help(argv[0]);
-                close_database(&db);
                 return 1;
         }
+    }
+
+    if (opts.run_daemon) {
+        is_daemon_mode = true;
+        openlog("netmon", LOG_PID | LOG_CONS, LOG_DAEMON);
+        daemonize();
+    }
+
+    Database db = {0};
+    if (!init_database(&db)) {
+        if (is_daemon_mode) closelog();
+        return 1;
     }
 
     if (opts.run_daemon || opts.record_snapshot) {
@@ -778,5 +855,9 @@ int main(int argc, char *argv[]) {
     }
 
     close_database(&db);
+    if (is_daemon_mode) {
+        closelog();
+    }
+
     return 0;
 }

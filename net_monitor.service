@@ -1,0 +1,20 @@
+[Unit]
+Description=Network Usage Monitor Daemon (NetMonitor)
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=/home/abdallah_mamdouh/Projects/NetMonitor/netmon --daemon
+WorkingDirectory=/home/abdallah_mamdouh/Projects/NetMonitor
+Restart=always
+RestartSec=10
+User=root
+
+# Security sandboxing
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/abdallah_mamdouh/Projects/NetMonitor
+
+[Install]
+WantedBy=multi-user.target
