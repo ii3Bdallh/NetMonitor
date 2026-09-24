@@ -14,6 +14,7 @@ A lightweight, zero-dependency, high-performance Linux CLI tool and background d
 - 🚀 **Zero External Dependencies**: Statically linked with the embedded SQLite amalgamation (`sqlite3.c`).
 - 🔍 **Per-Process Tracking**: Programmatically correlates active socket inodes in `/proc/net/tcp` and `/proc/net/udp` with process descriptors in `/proc/[PID]/fd` and process names in `/proc/[PID]/comm`.
 - ⚡ **Ultra-Fast Batch Transactions**: Employs SQLite WAL mode (`Write-Ahead Logging`) for non-blocking sub-millisecond batch inserts every 60 seconds.
+- 🌐 **Internet vs LAN Breakdown**: Distinguishes between external Internet (WAN) quota consumption and internal Local Network (LAN / Wi-Fi sharing / Docker) traffic.
 - 🕒 **Flexible CLI Time Filters**: Query historical network usage by minutes, hours, days, weeks, months, or exact custom dates.
 - 📊 **SQL-Driven Queries & Sorting**: All filtering, aggregation, and sorting are executed directly within SQL (`WHERE`, `HAVING`, `ORDER BY`).
 - 🛡️ **Systemd Background Daemon**: Runs silently as a detached background service with double-fork daemonization and `syslog` integration.
