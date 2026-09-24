@@ -161,23 +161,25 @@ bool init_database(Database *database, bool for_writing) {
             "  app_name TEXT NOT NULL,"
             "  bytes_sent INTEGER NOT NULL DEFAULT 0,"
             "  bytes_received INTEGER NOT NULL DEFAULT 0,"
+            "  is_local INTEGER NOT NULL DEFAULT 0,"
             "  timestamp DATETIME DEFAULT (datetime('now', 'localtime'))"
             ");"
-            "CREATE INDEX IF NOT EXISTS idx_app_time ON network_usage(app_name, timestamp);";
+            "CREATE INDEX IF NOT EXISTS idx_app_time ON network_usage(app_name, timestamp);"
+            "CREATE INDEX IF NOT EXISTS idx_local_time ON network_usage(is_local, timestamp);";
 
         char *err_msg = NULL;
         rc = sqlite3_exec(database->db, create_table_sql, NULL, NULL, &err_msg);
         if (rc != SQLITE_OK) {
             log_message(LOG_ERR, "Failed to create database table: %s", err_msg);
             sqlite3_free(err_msg);
-            sqlite3_close(database->db);
-            database->db = NULL;
-            return false;
         }
 
+        // Automatic column migration if table existed before without is_local
+        sqlite3_exec(database->db, "ALTER TABLE network_usage ADD COLUMN is_local INTEGER NOT NULL DEFAULT 0;", NULL, NULL, NULL);
+
         const char *insert_sql =
-            "INSERT INTO network_usage (app_name, bytes_sent, bytes_received, timestamp) "
-            "VALUES (?, ?, ?, datetime('now', 'localtime'));";
+            "INSERT INTO network_usage (app_name, bytes_sent, bytes_received, is_local, timestamp) "
+            "VALUES (?, ?, ?, ?, datetime('now', 'localtime'));";
 
         rc = sqlite3_prepare_v2(database->db, insert_sql, -1, &database->insert_stmt, NULL);
         if (rc != SQLITE_OK) {
@@ -266,10 +268,41 @@ bool get_active_interface_stats(NetInterface *iface) {
     return found;
 }
 
+// Check if hex IP from /proc/net/tcp is in private LAN ranges (RFC 1918, loopback, multicast)
+bool is_hex_ip_local(const char *hex_ip) {
+    if (!hex_ip || strlen(hex_ip) < 8) return false;
+
+    unsigned int raw_ip = 0;
+    if (sscanf(hex_ip, "%x", &raw_ip) != 1) return false;
+
+    unsigned char b1 = raw_ip & 0xFF;
+    unsigned char b2 = (raw_ip >> 8) & 0xFF;
+    unsigned char b3 = (raw_ip >> 16) & 0xFF;
+    unsigned char b4 = (raw_ip >> 24) & 0xFF;
+    (void)b3; (void)b4;
+
+    // 127.0.0.0/8 (Loopback)
+    if (b1 == 127) return true;
+    // 10.0.0.0/8 (Private A)
+    if (b1 == 10) return true;
+    // 192.168.0.0/16 (Private C / Local Wi-Fi)
+    if (b1 == 192 && b2 == 168) return true;
+    // 172.16.0.0/12 (Private B / Docker / Containers)
+    if (b1 == 172 && (b2 >= 16 && b2 <= 31)) return true;
+    // 169.254.0.0/16 (Link-Local)
+    if (b1 == 169 && b2 == 254) return true;
+    // 224.0.0.0/4 (Multicast / Broadcast / mDNS)
+    if (b1 >= 224) return true;
+    // 0.0.0.0
+    if (b1 == 0 && b2 == 0) return true;
+
+    return false;
+}
+
 typedef struct {
     unsigned long inode;
     bool is_established;
-    bool is_remote;
+    bool is_local;
     pid_t pid;
 } SocketEntry;
 
@@ -285,7 +318,7 @@ void init_socket_list(SocketList *list) {
     list->entries = malloc(list->capacity * sizeof(SocketEntry));
 }
 
-void add_socket(SocketList *list, unsigned long inode, bool is_est, bool is_remote) {
+void add_socket(SocketList *list, unsigned long inode, bool is_est, bool is_local) {
     if (!list->entries) return;
 
     if (list->count >= list->capacity) {
@@ -298,7 +331,7 @@ void add_socket(SocketList *list, unsigned long inode, bool is_est, bool is_remo
 
     list->entries[list->count].inode = inode;
     list->entries[list->count].is_established = is_est;
-    list->entries[list->count].is_remote = is_remote;
+    list->entries[list->count].is_local = is_local;
     list->entries[list->count].pid = 0;
     list->count++;
 }
@@ -337,9 +370,9 @@ void parse_proc_net_file(const char *path, SocketList *list) {
                &dummy_d1, &dummy_d2, &inode);
 
         if (num_matched >= 11 && inode > 0) {
-            bool is_remote = (strncmp(rem_addr, "00000000", 8) != 0 && strncmp(rem_addr, "0100007F", 8) != 0);
+            bool is_local = is_hex_ip_local(rem_addr);
             bool is_est = (state == 1);
-            add_socket(list, inode, is_est, is_remote);
+            add_socket(list, inode, is_est, is_local);
         }
     }
 
@@ -366,7 +399,6 @@ void get_process_comm(pid_t pid, char *dest, size_t max_len) {
     }
 }
 
-// Read /proc/[PID]/io to get exact per-process syscall read/write traffic
 bool get_process_io_bytes(pid_t pid, unsigned long long *rchar, unsigned long long *wchar) {
     char io_path[128];
     snprintf(io_path, sizeof(io_path), "/proc/%d/io", pid);
@@ -406,13 +438,16 @@ typedef struct {
     unsigned long long delta_wchar;
     bool has_network_socket;
     bool has_active_stream;
+    bool is_mostly_local;
     bool seen;
 } PidSnapshot;
 
 typedef struct {
     char app_name[64];
-    unsigned long long accumulated_upload;   // TX
-    unsigned long long accumulated_download; // RX
+    unsigned long long wan_upload;
+    unsigned long long wan_download;
+    unsigned long long lan_upload;
+    unsigned long long lan_download;
 } AppBandwidth;
 
 typedef struct {
@@ -438,8 +473,10 @@ AppBandwidth* get_or_create_app(BandwidthTracker *tracker, const char *name) {
     if (tracker->count < MAX_TRACKED_APPS) {
         size_t idx = tracker->count++;
         snprintf(tracker->apps[idx].app_name, sizeof(tracker->apps[idx].app_name), "%s", name);
-        tracker->apps[idx].accumulated_upload = 0;
-        tracker->apps[idx].accumulated_download = 0;
+        tracker->apps[idx].wan_upload = 0;
+        tracker->apps[idx].wan_download = 0;
+        tracker->apps[idx].lan_upload = 0;
+        tracker->apps[idx].lan_download = 0;
         return &tracker->apps[idx];
     }
     return NULL;
@@ -461,18 +498,19 @@ PidSnapshot* get_or_create_pid(BandwidthTracker *tracker, pid_t pid) {
         tracker->pids[idx].delta_wchar = 0;
         tracker->pids[idx].has_network_socket = false;
         tracker->pids[idx].has_active_stream = false;
+        tracker->pids[idx].is_mostly_local = false;
         tracker->pids[idx].seen = true;
         return &tracker->pids[idx];
     }
     return NULL;
 }
 
-// Map network sockets to PIDs and sample process IO deltas
 void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_list) {
     for (size_t i = 0; i < tracker->pid_count; i++) {
         tracker->pids[i].seen = false;
         tracker->pids[i].has_network_socket = false;
         tracker->pids[i].has_active_stream = false;
+        tracker->pids[i].is_mostly_local = false;
         tracker->pids[i].delta_rchar = 0;
         tracker->pids[i].delta_wchar = 0;
     }
@@ -495,6 +533,8 @@ void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_l
 
         bool has_net = false;
         bool has_active = false;
+        int local_sockets = 0;
+        int remote_sockets = 0;
 
         struct dirent *fd_entry;
         while ((fd_entry = readdir(fd_dir)) != NULL) {
@@ -511,11 +551,15 @@ void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_l
             unsigned long inode = 0;
             if (sscanf(link_target, "socket:[%lu]", &inode) == 1 && inode > 0) {
                 has_net = true;
-                // Check if this socket is active/established
                 for (size_t s = 0; s < sock_list->count; s++) {
                     if (sock_list->entries[s].inode == inode) {
                         if (sock_list->entries[s].is_established) {
                             has_active = true;
+                        }
+                        if (sock_list->entries[s].is_local) {
+                            local_sockets++;
+                        } else {
+                            remote_sockets++;
                         }
                     }
                 }
@@ -529,6 +573,7 @@ void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_l
                 ps->seen = true;
                 ps->has_network_socket = true;
                 ps->has_active_stream = has_active;
+                ps->is_mostly_local = (local_sockets > 0 && remote_sockets == 0);
 
                 unsigned long long rchar = 0, wchar = 0;
                 if (get_process_io_bytes(pid, &rchar, &wchar)) {
@@ -547,7 +592,6 @@ void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_l
     closedir(proc_dir);
 }
 
-// Accurately distribute network interface delta (RX/TX) based on actual process IO delta
 void attribute_bandwidth(BandwidthTracker *tracker, unsigned long long delta_rx, unsigned long long delta_tx) {
     if (delta_rx == 0 && delta_tx == 0) return;
 
@@ -573,21 +617,32 @@ void attribute_bandwidth(BandwidthTracker *tracker, unsigned long long delta_rx,
                 unsigned long long share_rx = (delta_rx * tracker->pids[i].delta_rchar) / total_active_rchar;
                 if (share_rx > 0) {
                     AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
-                    if (app) app->accumulated_download += share_rx;
+                    if (app) {
+                        if (tracker->pids[i].is_mostly_local) {
+                            app->lan_download += share_rx;
+                        } else {
+                            app->wan_download += share_rx;
+                        }
+                    }
                 }
             }
         } else if (active_stream_count > 0) {
-            // Fallback to active established stream processes
             unsigned long long share_rx = delta_rx / active_stream_count;
             for (size_t i = 0; i < tracker->pid_count; i++) {
                 if (tracker->pids[i].seen && tracker->pids[i].has_active_stream) {
                     AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
-                    if (app) app->accumulated_download += share_rx;
+                    if (app) {
+                        if (tracker->pids[i].is_mostly_local) {
+                            app->lan_download += share_rx;
+                        } else {
+                            app->wan_download += share_rx;
+                        }
+                    }
                 }
             }
         } else {
             AppBandwidth *app = get_or_create_app(tracker, "system-network");
-            if (app) app->accumulated_download += delta_rx;
+            if (app) app->wan_download += delta_rx;
         }
     }
 
@@ -599,7 +654,13 @@ void attribute_bandwidth(BandwidthTracker *tracker, unsigned long long delta_rx,
                 unsigned long long share_tx = (delta_tx * tracker->pids[i].delta_wchar) / total_active_wchar;
                 if (share_tx > 0) {
                     AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
-                    if (app) app->accumulated_upload += share_tx;
+                    if (app) {
+                        if (tracker->pids[i].is_mostly_local) {
+                            app->lan_upload += share_tx;
+                        } else {
+                            app->wan_upload += share_tx;
+                        }
+                    }
                 }
             }
         } else if (active_stream_count > 0) {
@@ -607,12 +668,18 @@ void attribute_bandwidth(BandwidthTracker *tracker, unsigned long long delta_rx,
             for (size_t i = 0; i < tracker->pid_count; i++) {
                 if (tracker->pids[i].seen && tracker->pids[i].has_active_stream) {
                     AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
-                    if (app) app->accumulated_upload += share_tx;
+                    if (app) {
+                        if (tracker->pids[i].is_mostly_local) {
+                            app->lan_upload += share_tx;
+                        } else {
+                            app->wan_upload += share_tx;
+                        }
+                    }
                 }
             }
         } else {
             AppBandwidth *app = get_or_create_app(tracker, "system-network");
-            if (app) app->accumulated_upload += delta_tx;
+            if (app) app->wan_upload += delta_tx;
         }
     }
 }
@@ -622,7 +689,8 @@ bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
 
     bool has_records = false;
     for (size_t i = 0; i < tracker->count; i++) {
-        if (tracker->apps[i].accumulated_download > 0 || tracker->apps[i].accumulated_upload > 0) {
+        if (tracker->apps[i].wan_download > 0 || tracker->apps[i].wan_upload > 0 ||
+            tracker->apps[i].lan_download > 0 || tracker->apps[i].lan_upload > 0) {
             has_records = true;
             break;
         }
@@ -633,18 +701,36 @@ bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
     sqlite3_exec(database->db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
 
     for (size_t i = 0; i < tracker->count; i++) {
-        if (tracker->apps[i].accumulated_download > 0 || tracker->apps[i].accumulated_upload > 0) {
+        // 1. Insert WAN records (Internet / Quota)
+        if (tracker->apps[i].wan_download > 0 || tracker->apps[i].wan_upload > 0) {
             sqlite3_reset(database->insert_stmt);
             sqlite3_clear_bindings(database->insert_stmt);
 
             sqlite3_bind_text(database->insert_stmt, 1, tracker->apps[i].app_name, -1, SQLITE_STATIC);
-            sqlite3_bind_int64(database->insert_stmt, 2, (sqlite3_int64)tracker->apps[i].accumulated_upload);
-            sqlite3_bind_int64(database->insert_stmt, 3, (sqlite3_int64)tracker->apps[i].accumulated_download);
+            sqlite3_bind_int64(database->insert_stmt, 2, (sqlite3_int64)tracker->apps[i].wan_upload);
+            sqlite3_bind_int64(database->insert_stmt, 3, (sqlite3_int64)tracker->apps[i].wan_download);
+            sqlite3_bind_int(database->insert_stmt, 4, 0); // is_local = 0 (WAN)
 
             sqlite3_step(database->insert_stmt);
 
-            tracker->apps[i].accumulated_upload = 0;
-            tracker->apps[i].accumulated_download = 0;
+            tracker->apps[i].wan_upload = 0;
+            tracker->apps[i].wan_download = 0;
+        }
+
+        // 2. Insert LAN records (Local Network)
+        if (tracker->apps[i].lan_download > 0 || tracker->apps[i].lan_upload > 0) {
+            sqlite3_reset(database->insert_stmt);
+            sqlite3_clear_bindings(database->insert_stmt);
+
+            sqlite3_bind_text(database->insert_stmt, 1, tracker->apps[i].app_name, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(database->insert_stmt, 2, (sqlite3_int64)tracker->apps[i].lan_upload);
+            sqlite3_bind_int64(database->insert_stmt, 3, (sqlite3_int64)tracker->apps[i].lan_download);
+            sqlite3_bind_int(database->insert_stmt, 4, 1); // is_local = 1 (LAN)
+
+            sqlite3_step(database->insert_stmt);
+
+            tracker->apps[i].lan_upload = 0;
+            tracker->apps[i].lan_download = 0;
         }
     }
 
@@ -741,6 +827,7 @@ void query_database(Database *database, const CliOptions *opts) {
 
     const char *order_dir = opts->sort_asc ? "ASC" : "DESC";
 
+    // 1. Per-Application Summary Query
     snprintf(sql,
              sizeof(sql),
              "SELECT app_name, "
@@ -808,22 +895,78 @@ void query_database(Database *database, const CliOptions *opts) {
         grand_total_download += download;
         row_count++;
     }
+    sqlite3_finalize(stmt);
 
     if (row_count == 0) {
         printf("  No matching records found in database for the given criteria.\n");
-    } else {
-        printf("---------------------------------------------------------------------------------------------------\n");
-        char total_up_str[32], total_down_str[32], grand_total_str[32];
-        format_bytes(grand_total_upload, total_up_str, sizeof(total_up_str));
-        format_bytes(grand_total_download, total_down_str, sizeof(total_down_str));
-        format_bytes(grand_total_upload + grand_total_download, grand_total_str, sizeof(grand_total_str));
-
-        printf("%-24s %-16s %-16s %-16s Total Rows: %d\n",
-               "TOTAL AGGREGATED", total_up_str, total_down_str, grand_total_str, row_count);
+        printf("===================================================================================================\n\n");
+        return;
     }
-    printf("===================================================================================================\n\n");
 
-    sqlite3_finalize(stmt);
+    printf("---------------------------------------------------------------------------------------------------\n");
+    char total_up_str[32], total_down_str[32], grand_total_str[32];
+    format_bytes(grand_total_upload, total_up_str, sizeof(total_up_str));
+    format_bytes(grand_total_download, total_down_str, sizeof(total_down_str));
+    format_bytes(grand_total_upload + grand_total_download, grand_total_str, sizeof(grand_total_str));
+
+    printf("%-24s %-16s %-16s %-16s Total Rows: %d\n",
+           "TOTAL AGGREGATED", total_up_str, total_down_str, grand_total_str, row_count);
+    printf("---------------------------------------------------------------------------------------------------\n");
+
+    // 2. WAN vs LAN Breakdown Query (Executed in SQL)
+    char split_sql[1024];
+    snprintf(split_sql,
+             sizeof(split_sql),
+             "SELECT is_local, "
+             "       SUM(bytes_sent) AS sum_sent, "
+             "       SUM(bytes_received) AS sum_recv, "
+             "       SUM(bytes_sent + bytes_received) AS sum_total "
+             "FROM network_usage "
+             "%s "
+             "GROUP BY is_local;",
+             where_clause);
+
+    sqlite3_stmt *split_stmt = NULL;
+    unsigned long long wan_up = 0, wan_down = 0, wan_tot = 0;
+    unsigned long long lan_up = 0, lan_down = 0, lan_tot = 0;
+
+    if (sqlite3_prepare_v2(database->db, split_sql, -1, &split_stmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(split_stmt) == SQLITE_ROW) {
+            int is_local = sqlite3_column_int(split_stmt, 0);
+            unsigned long long s_up = (unsigned long long)sqlite3_column_int64(split_stmt, 1);
+            unsigned long long s_down = (unsigned long long)sqlite3_column_int64(split_stmt, 2);
+            unsigned long long s_tot = (unsigned long long)sqlite3_column_int64(split_stmt, 3);
+
+            if (is_local == 1) {
+                lan_up = s_up;
+                lan_down = s_down;
+                lan_tot = s_tot;
+            } else {
+                wan_up = s_up;
+                wan_down = s_down;
+                wan_tot = s_tot;
+            }
+        }
+        sqlite3_finalize(split_stmt);
+    }
+
+    char wan_tot_str[32], wan_up_str[32], wan_down_str[32];
+    char lan_tot_str[32], lan_up_str[32], lan_down_str[32];
+
+    format_bytes(wan_tot, wan_tot_str, sizeof(wan_tot_str));
+    format_bytes(wan_up, wan_up_str, sizeof(wan_up_str));
+    format_bytes(wan_down, wan_down_str, sizeof(wan_down_str));
+
+    format_bytes(lan_tot, lan_tot_str, sizeof(lan_tot_str));
+    format_bytes(lan_up, lan_up_str, sizeof(lan_up_str));
+    format_bytes(lan_down, lan_down_str, sizeof(lan_down_str));
+
+    printf("  🌐 Internet / WAN (Quota Usage) : %-10s (Upload: %-9s | Download: %-9s)\n",
+           wan_tot_str, wan_up_str, wan_down_str);
+    printf("  🏠 Local / LAN    (Network Sharing): %-10s (Upload: %-9s | Download: %-9s)\n",
+           lan_tot_str, lan_up_str, lan_down_str);
+
+    printf("===================================================================================================\n\n");
 }
 
 // Continuous Background Daemon Collector
