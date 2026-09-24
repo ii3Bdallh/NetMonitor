@@ -205,6 +205,22 @@ void close_database(Database *database) {
     }
 }
 
+bool clear_database(Database *database) {
+    if (!database->db) return false;
+    char *err_msg = NULL;
+    int rc = sqlite3_exec(database->db, "DELETE FROM network_usage; VACUUM;", NULL, NULL, &err_msg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[ERROR] Failed to clear database: %s\n", err_msg ? err_msg : "Unknown error");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    printf("===================================================================================================\n");
+    printf(" [✓] Successfully cleared all network usage history from database.\n");
+    printf(" Database: %s\n", database->db_path);
+    printf("===================================================================================================\n");
+    return true;
+}
+
 // ==========================================
 // Network Interface & Sockets Collection
 // ==========================================
@@ -836,6 +852,7 @@ typedef struct {
     bool sort_asc;
     bool run_daemon;
     bool record_snapshot;
+    bool clear_history;
 } CliOptions;
 
 void print_help(const char *prog_name) {
@@ -853,6 +870,8 @@ void print_help(const char *prog_name) {
     printf("Size Filtering & Sorting (Executed in SQL):\n");
     printf("      --min <SIZE>            Filter apps with traffic >= size (e.g., 200M, 1G, 500K)\n");
     printf("  -s, --sort <asc|desc>       Sort results by total consumption (default: desc)\n\n");
+    printf("Database Management:\n");
+    printf("      --clear, --reset        Clear / reset all historical records from database\n\n");
     printf("Daemon & Execution Modes:\n");
     printf("  -D, --daemon                Run as background daemon service (logs to syslog)\n");
     printf("  -h, --help                  Display this help message and exit\n\n");
@@ -862,6 +881,7 @@ void print_help(const char *prog_name) {
     printf("  %s --last-day 5 --sort desc\n", prog_name);
     printf("  %s --last-week 4 --min 200M\n", prog_name);
     printf("  %s --custom \"2026-09-24\" --sort asc\n", prog_name);
+    printf("  %s --clear\n", prog_name);
     printf("=========================================================================\n");
 }
 
@@ -1114,7 +1134,8 @@ int main(int argc, char *argv[]) {
     enum {
         OPT_LAST_MINUTE = 1000,
         OPT_LAST_HOUR,
-        OPT_MIN_SIZE
+        OPT_MIN_SIZE,
+        OPT_CLEAR
     };
 
     static struct option long_options[] = {
@@ -1127,6 +1148,8 @@ int main(int argc, char *argv[]) {
         {"custom",      required_argument, 0, 'c'},
         {"min",         required_argument, 0, OPT_MIN_SIZE},
         {"sort",        required_argument, 0, 's'},
+        {"clear",       no_argument,       0, OPT_CLEAR},
+        {"reset",       no_argument,       0, OPT_CLEAR},
         {"daemon",      no_argument,       0, 'D'},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -1205,6 +1228,10 @@ int main(int argc, char *argv[]) {
                 }
                 break;
 
+            case OPT_CLEAR:
+                opts.clear_history = true;
+                break;
+
             case 'D':
                 opts.run_daemon = true;
                 break;
@@ -1217,6 +1244,16 @@ int main(int argc, char *argv[]) {
                 print_help(argv[0]);
                 return 1;
         }
+    }
+
+    if (opts.clear_history) {
+        Database db = {0};
+        if (!init_database(&db, true)) {
+            return 1;
+        }
+        clear_database(&db);
+        close_database(&db);
+        return 0;
     }
 
     if (opts.run_daemon) {

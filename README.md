@@ -116,6 +116,12 @@ netmon --last-day --sort desc
 netmon --last-day --sort asc
 ```
 
+### 5. Clear Database History (`--clear` / `--reset`)
+```bash
+# Clear all historical usage records and vacuum database
+netmon --clear
+```
+
 ---
 
 ## 🖥️ Example Output
