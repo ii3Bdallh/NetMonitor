@@ -5,16 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=forking
-ExecStart=/home/abdallah_mamdouh/Projects/NetMonitor/netmon --daemon
+ExecStart=/usr/local/bin/netmon --daemon
 WorkingDirectory=/home/abdallah_mamdouh/Projects/NetMonitor
 Restart=always
 RestartSec=10
 User=root
-
-# Security sandboxing
-ProtectSystem=full
-ProtectHome=read-only
-ReadWritePaths=/home/abdallah_mamdouh/Projects/NetMonitor
 
 [Install]
 WantedBy=multi-user.target
