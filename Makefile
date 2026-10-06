@@ -1,6 +1,7 @@
 CC = gcc
-CFLAGS = -O2 -Wall -Wextra
-LIBS = -lpthread -ldl -lm
+CFLAGS = -O2 -Wall -Wextra -Iinclude -I.
+LDFLAGS = -Llib
+LIBS = -lpcap -lpthread -ldl -lm
 TARGET = netmon
 SERVICE_FILE = net_monitor.service
 INSTALL_BIN = /usr/local/bin
@@ -15,7 +16,7 @@ sqlite3.o: sqlite3.c sqlite3.h
 
 $(TARGET): main.c sqlite3.o
 	@echo "[*] Building $(TARGET)..."
-	@$(CC) $(CFLAGS) main.c sqlite3.o -o $(TARGET) $(LIBS)
+	@$(CC) $(CFLAGS) $(LDFLAGS) main.c sqlite3.o -o $(TARGET) $(LIBS)
 	@echo "[✓] Build complete: ./$(TARGET)"
 
 install: $(TARGET)

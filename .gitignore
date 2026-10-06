@@ -11,3 +11,7 @@ netmon
 *.db
 *.db-wal
 *.db-shm
+
+# Local vendor development libraries
+include/
+lib/

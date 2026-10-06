@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <dirent.h>
 #include <ctype.h>
 #include <time.h>
@@ -13,19 +14,53 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <pthread.h>
 
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+
+#include <pcap.h>
 #include "sqlite3.h"
 
-#define SYSTEM_DB_DIR  "/var/lib/netmon"
-#define SYSTEM_DB_FILE "/var/lib/netmon/usage.db"
-#define PROC_NET_DEV "/proc/net/dev"
-#define BUFFER_SIZE 512
+// ============================================================================
+// Constants and Definitions
+// ============================================================================
+#define SYSTEM_DB_DIR          "/var/lib/netmon"
+#define SYSTEM_DB_FILE         "/var/lib/netmon/usage.db"
+#define PROC_NET_DEV           "/proc/net/dev"
+#define BUFFER_SIZE            512
 #define BATCH_INTERVAL_SECONDS 60
-#define MAX_TRACKED_APPS 512
-#define MAX_PIDS 4096
 
+#define MAX_TRACKED_APPS       512
+#define MAX_PIDS               4096
+#define MAX_HOST_IPS           64
+#define MAX_INTERFACES         32
+
+#define PACKET_QUEUE_CAPACITY  65536
+#define BATCH_DEQUEUE_SIZE     4096
+
+#define INODE_HASH_BUCKETS     4096
+#define MAX_INODE_ENTRIES      16384
+
+#define SOCKET_HASH_BUCKETS    8192
+#define MAX_SOCKET_ENTRIES     16384
+
+#define DIR_UNKNOWN            0
+#define DIR_TX                 1 // Outgoing (Sent / Upload)
+#define DIR_RX                 2 // Incoming (Received / Download)
+
+// ============================================================================
+// Global Flags and Settings
+// ============================================================================
 static volatile bool keep_running = true;
 static bool is_daemon_mode = false;
+static bool config_treat_cgnat_as_local = false; // Default: CGNAT (100.64.0.0/10) is WAN
 
 void handle_signal(int sig) {
     (void)sig;
@@ -42,6 +77,10 @@ void log_message(int priority, const char *format, ...) {
             fprintf(stderr, "[ERROR] ");
             vfprintf(stderr, format, args);
             fprintf(stderr, "\n");
+        } else if (priority == LOG_WARNING) {
+            fprintf(stderr, "[WARNING] ");
+            vfprintf(stderr, format, args);
+            fprintf(stderr, "\n");
         } else {
             vprintf(format, args);
             printf("\n");
@@ -50,6 +89,9 @@ void log_message(int priority, const char *format, ...) {
     va_end(args);
 }
 
+// ============================================================================
+// System Paths & Daemonization
+// ============================================================================
 void get_database_path(char *dest, size_t maxlen, bool for_writing) {
     if (access(SYSTEM_DB_FILE, R_OK) == 0) {
         snprintf(dest, maxlen, "%s", SYSTEM_DB_FILE);
@@ -79,7 +121,8 @@ void get_database_path(char *dest, size_t maxlen, bool for_writing) {
         if (for_writing) {
             char cmd[600];
             snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\"", user_dir);
-            system(cmd);
+            int ret = system(cmd);
+            (void)ret;
             snprintf(dest, maxlen, "%s", user_db);
             return;
         }
@@ -127,9 +170,9 @@ void daemonize(void) {
     }
 }
 
-// ==========================================
+// ============================================================================
 // SQLite Database Layer
-// ==========================================
+// ============================================================================
 typedef struct {
     sqlite3 *db;
     sqlite3_stmt *insert_stmt;
@@ -188,7 +231,12 @@ bool init_database(Database *database, bool for_writing) {
             return false;
         }
 
-        chmod(database->db_path, 0664);
+        chmod(database->db_path, 0666);
+        char wal_path[550], shm_path[550];
+        snprintf(wal_path, sizeof(wal_path), "%s-wal", database->db_path);
+        snprintf(shm_path, sizeof(shm_path), "%s-shm", database->db_path);
+        chmod(wal_path, 0666);
+        chmod(shm_path, 0666);
     }
 
     return true;
@@ -207,10 +255,22 @@ void close_database(Database *database) {
 
 bool clear_database(Database *database) {
     if (!database->db) return false;
+
+    if (access(database->db_path, W_OK) != 0) {
+        fprintf(stderr, "\n[ERROR] Cannot clear database: Write permission denied on '%s'.\n", database->db_path);
+        fprintf(stderr, "[HINT] The database is owned by root. Please run with sudo:\n");
+        fprintf(stderr, "       sudo netmon --clear\n\n");
+        return false;
+    }
+
     char *err_msg = NULL;
     int rc = sqlite3_exec(database->db, "DELETE FROM network_usage; VACUUM;", NULL, NULL, &err_msg);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "[ERROR] Failed to clear database: %s\n", err_msg ? err_msg : "Unknown error");
+        fprintf(stderr, "\n[ERROR] Failed to clear database: %s\n", err_msg ? err_msg : "Unknown error");
+        if (rc == SQLITE_READONLY || (err_msg && strstr(err_msg, "readonly"))) {
+            fprintf(stderr, "[HINT] The database is opened read-only or locked by system service. Run with sudo:\n");
+            fprintf(stderr, "       sudo netmon --clear\n\n");
+        }
         sqlite3_free(err_msg);
         return false;
     }
@@ -221,9 +281,9 @@ bool clear_database(Database *database) {
     return true;
 }
 
-// ==========================================
-// Network Interface & Sockets Collection
-// ==========================================
+// ============================================================================
+// Interface Filtering & /proc/net/dev Stats
+// ============================================================================
 typedef struct {
     unsigned long long rx_bytes;
     unsigned long long tx_bytes;
@@ -232,10 +292,14 @@ typedef struct {
 bool is_ignored_interface(const char *name) {
     if (!name) return true;
     if (strcmp(name, "lo") == 0) return true;
-    // Exclude virtual docker bridges and veth endpoints to avoid double counting physical NICs
+    if (strcmp(name, "any") == 0) return true;
     if (strncmp(name, "veth", 4) == 0) return true;
     if (strncmp(name, "br-", 3) == 0) return true;
     if (strcmp(name, "docker0") == 0) return true;
+    if (strncmp(name, "usbmon", 6) == 0) return true;
+    if (strncmp(name, "bluetooth", 9) == 0) return true;
+    if (strncmp(name, "nflog", 5) == 0) return true;
+    if (strncmp(name, "nfqueue", 7) == 0) return true;
     return false;
 }
 
@@ -266,7 +330,8 @@ bool get_all_interfaces_stats(TotalNetStats *stats) {
         }
 
         *colon = '\0';
-        sscanf(line, "%s", if_name);
+        // Corrected format specifier from %s to %31s to prevent buffer overflow
+        sscanf(line, "%31s", if_name);
 
         if (is_ignored_interface(if_name)) {
             continue;
@@ -288,13 +353,126 @@ bool get_all_interfaces_stats(TotalNetStats *stats) {
     return found;
 }
 
-// Check if an IPv4 or IPv6 address belongs to private/local network (RFC 1918, link-local, loopback, CGNAT)
+// ============================================================================
+// Host Local IPs List (for Direction Resolution)
+// ============================================================================
+typedef struct {
+    uint32_t v4[MAX_HOST_IPS];
+    size_t v4_count;
+    struct in6_addr v6[MAX_HOST_IPS];
+    size_t v6_count;
+} HostIpList;
+
+static HostIpList g_host_ips;
+
+void update_host_ips(HostIpList *list) {
+    list->v4_count = 0;
+    list->v6_count = 0;
+
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) == -1) {
+        return;
+    }
+
+    for (struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || !ifa->ifa_name) continue;
+        if (is_ignored_interface(ifa->ifa_name)) continue;
+
+        int family = ifa->ifa_addr->sa_family;
+        if (family == AF_INET && list->v4_count < MAX_HOST_IPS) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+            list->v4[list->v4_count++] = sa->sin_addr.s_addr; // Network byte order
+        } else if (family == AF_INET6 && list->v6_count < MAX_HOST_IPS) {
+            struct sockaddr_in6 *sa = (struct sockaddr_in6 *)ifa->ifa_addr;
+            memcpy(&list->v6[list->v6_count++], &sa->sin6_addr, sizeof(struct in6_addr));
+        }
+    }
+
+    freeifaddrs(ifaddr);
+}
+
+bool is_host_ipv4(const HostIpList *list, uint32_t ip_net) {
+    for (size_t i = 0; i < list->v4_count; i++) {
+        if (list->v4[i] == ip_net) return true;
+    }
+    return false;
+}
+
+bool is_host_ipv6(const HostIpList *list, const struct in6_addr *ip6) {
+    for (size_t i = 0; i < list->v6_count; i++) {
+        if (memcmp(&list->v6[i], ip6, sizeof(struct in6_addr)) == 0) return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// LAN vs WAN IP Classification (RFC 1918, Link-Local, CGNAT, etc.)
+// ============================================================================
+bool is_ipv4_local(uint32_t ip_net_order) {
+    const unsigned char *b = (const unsigned char *)&ip_net_order;
+    unsigned char b1 = b[0];
+    unsigned char b2 = b[1];
+
+    if (b1 == 127) return true; // Loopback
+    if (b1 == 10) return true;  // 10.0.0.0/8
+    if (b1 == 192 && b2 == 168) return true; // 192.168.0.0/16
+    if (b1 == 172 && (b2 >= 16 && b2 <= 31)) return true; // 172.16.0.0/12
+    if (b1 == 169 && b2 == 254) return true; // 169.254.0.0/16 Link-Local
+    if (b1 >= 224) return true; // Multicast
+    if (b1 == 0 && b2 == 0) return true; // 0.0.0.0
+
+    // CGNAT 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+    // By default treated as WAN (Internet), configurable via --cgnat-local
+    if (b1 == 100 && (b2 >= 64 && b2 <= 127)) {
+        return config_treat_cgnat_as_local;
+    }
+
+    return false;
+}
+
+bool is_ipv6_local(const unsigned char *ip6) {
+    // 1. Unspecified :: (all zeros)
+    bool all_zero = true;
+    for (int i = 0; i < 16; i++) {
+        if (ip6[i] != 0) { all_zero = false; break; }
+    }
+    if (all_zero) return true;
+
+    // 2. Loopback ::1 (15 zeros + 0x01)
+    bool is_loopback = true;
+    for (int i = 0; i < 15; i++) {
+        if (ip6[i] != 0) { is_loopback = false; break; }
+    }
+    if (is_loopback && ip6[15] == 1) return true;
+
+    // 3. IPv4-mapped IPv6 (::ffff:w.x.y.z)
+    bool is_v4_mapped = true;
+    for (int i = 0; i < 10; i++) {
+        if (ip6[i] != 0) { is_v4_mapped = false; break; }
+    }
+    if (is_v4_mapped && ip6[10] == 0xFF && ip6[11] == 0xFF) {
+        uint32_t v4_net;
+        memcpy(&v4_net, ip6 + 12, 4);
+        return is_ipv4_local(v4_net);
+    }
+
+    // 4. fe80::/10 (Link-Local)
+    if (ip6[0] == 0xFE && (ip6[1] & 0xC0) == 0x80) return true;
+
+    // 5. fc00::/7 (ULA private IPv6)
+    if ((ip6[0] & 0xFE) == 0xFC) return true;
+
+    // 6. ff00::/8 (Multicast)
+    if (ip6[0] == 0xFF) return true;
+
+    return false;
+}
+
 bool is_hex_ip_local(const char *hex_ip) {
     if (!hex_ip) return false;
     size_t len = strlen(hex_ip);
     if (len < 8) return false;
 
-    // IPv6 Address (32 hex characters in /proc/net/tcp6: 4 words of 32-bit little-endian on x86)
     if (len == 32) {
         unsigned char ip6[16];
         for (int w = 0; w < 4; w++) {
@@ -302,171 +480,23 @@ bool is_hex_ip_local(const char *hex_ip) {
             char word_str[9] = {0};
             strncpy(word_str, hex_ip + (w * 8), 8);
             if (sscanf(word_str, "%x", &word) != 1) return false;
-            // Reverse CPU endianness per 32-bit word to reconstruct 16-byte network order IPv6
             ip6[w * 4 + 0] = (word >> 0) & 0xFF;
             ip6[w * 4 + 1] = (word >> 8) & 0xFF;
             ip6[w * 4 + 2] = (word >> 16) & 0xFF;
             ip6[w * 4 + 3] = (word >> 24) & 0xFF;
         }
-
-        // 1. Unspecified :: (all zeros)
-        bool all_zero = true;
-        for (int i = 0; i < 16; i++) {
-            if (ip6[i] != 0) { all_zero = false; break; }
-        }
-        if (all_zero) return true;
-
-        // 2. Loopback ::1 (15 zeros + 0x01)
-        bool is_loopback = true;
-        for (int i = 0; i < 15; i++) {
-            if (ip6[i] != 0) { is_loopback = false; break; }
-        }
-        if (is_loopback && ip6[15] == 1) return true;
-
-        // 3. IPv4-mapped IPv6 (::ffff:w.x.y.z -> 10 zeros + 0xFF + 0xFF + 4 bytes IPv4)
-        bool is_v4_mapped = true;
-        for (int i = 0; i < 10; i++) {
-            if (ip6[i] != 0) { is_v4_mapped = false; break; }
-        }
-        if (is_v4_mapped && ip6[10] == 0xFF && ip6[11] == 0xFF) {
-            unsigned char b1 = ip6[12];
-            unsigned char b2 = ip6[13];
-            if (b1 == 127) return true; // Loopback
-            if (b1 == 10) return true;  // 10.0.0.0/8
-            if (b1 == 192 && b2 == 168) return true; // 192.168.0.0/16
-            if (b1 == 172 && (b2 >= 16 && b2 <= 31)) return true; // 172.16.0.0/12
-            if (b1 == 100 && (b2 >= 64 && b2 <= 127)) return true; // 100.64.0.0/10 (CGNAT / Tailscale)
-            if (b1 == 169 && b2 == 254) return true; // 169.254.0.0/16 Link-Local
-            if (b1 >= 224) return true; // Multicast
-            if (b1 == 0 && b2 == 0) return true;
-            return false;
-        }
-
-        // 4. fe80::/10 (Link-Local IPv6: 1111 1110 10xx xxxx)
-        if (ip6[0] == 0xFE && (ip6[1] & 0xC0) == 0x80) return true;
-
-        // 5. fc00::/7 (Unique Local Address - ULA private IPv6: fc00:: and fd00::)
-        if ((ip6[0] & 0xFE) == 0xFC) return true;
-
-        // 6. ff00::/8 (Multicast IPv6)
-        if (ip6[0] == 0xFF) return true;
-
-        return false;
+        return is_ipv6_local(ip6);
     }
 
-    // Standard 8-character IPv4 (little-endian 32-bit int in /proc/net/tcp)
     unsigned int raw_ip = 0;
     if (sscanf(hex_ip, "%x", &raw_ip) != 1) return false;
-
-    unsigned char b1 = raw_ip & 0xFF;
-    unsigned char b2 = (raw_ip >> 8) & 0xFF;
-
-    if (b1 == 127) return true;
-    if (b1 == 10) return true;
-    if (b1 == 192 && b2 == 168) return true;
-    if (b1 == 172 && (b2 >= 16 && b2 <= 31)) return true;
-    if (b1 == 100 && (b2 >= 64 && b2 <= 127)) return true; // 100.64.0.0/10 (CGNAT / Tailscale)
-    if (b1 == 169 && b2 == 254) return true;
-    if (b1 >= 224) return true;
-    if (b1 == 0 && b2 == 0) return true;
-
-    return false;
+    // On x86 little endian, raw_ip parsed as %x has the exact network order layout
+    return is_ipv4_local(raw_ip);
 }
 
-typedef struct {
-    unsigned long inode;
-    bool is_established;
-    bool is_local;
-    unsigned int port;
-    pid_t pid;
-} SocketEntry;
-
-typedef struct {
-    SocketEntry *entries;
-    size_t count;
-    size_t capacity;
-} SocketList;
-
-void init_socket_list(SocketList *list) {
-    list->count = 0;
-    list->capacity = 256;
-    list->entries = malloc(list->capacity * sizeof(SocketEntry));
-}
-
-void add_socket(SocketList *list, unsigned long inode, bool is_est, bool is_local, unsigned int port) {
-    if (!list->entries) return;
-
-    if (list->count >= list->capacity) {
-        size_t new_cap = list->capacity * 2;
-        SocketEntry *new_entries = realloc(list->entries, new_cap * sizeof(SocketEntry));
-        if (!new_entries) return;
-        list->entries = new_entries;
-        list->capacity = new_cap;
-    }
-
-    list->entries[list->count].inode = inode;
-    list->entries[list->count].is_established = is_est;
-    list->entries[list->count].is_local = is_local;
-    list->entries[list->count].port = port;
-    list->entries[list->count].pid = 0;
-    list->count++;
-}
-
-void free_socket_list(SocketList *list) {
-    if (list->entries) {
-        free(list->entries);
-        list->entries = NULL;
-    }
-    list->count = 0;
-    list->capacity = 0;
-}
-
-void parse_proc_net_file(const char *path, SocketList *list) {
-    FILE *f = fopen(path, "r");
-    if (!f) return;
-
-    char line[BUFFER_SIZE];
-    if (!fgets(line, sizeof(line), f)) {
-        fclose(f);
-        return;
-    }
-
-    while (fgets(line, sizeof(line), f)) {
-        unsigned long inode = 0;
-        char local_addr[128], rem_addr[128];
-        unsigned int state = 0;
-        unsigned long tx_q = 0, rx_q = 0;
-        int dummy_d1 = 0, dummy_d2 = 0;
-        unsigned long dummy_ul1 = 0, dummy_ul2 = 0, dummy_ul3 = 0;
-
-        int num_matched = sscanf(line,
-               "%*d: %127s %127s %x %lx:%lx %lx:%lx %lx %d %d %lu",
-               local_addr, rem_addr, &state, &tx_q, &rx_q,
-               &dummy_ul1, &dummy_ul2, &dummy_ul3,
-               &dummy_d1, &dummy_d2, &inode);
-
-        if (num_matched >= 11 && inode > 0) {
-            char *colon = strchr(rem_addr, ':');
-            unsigned int port = 0;
-            if (colon) {
-                *colon = '\0';
-                sscanf(colon + 1, "%x", &port);
-            }
-
-            bool is_local = is_hex_ip_local(rem_addr);
-            // Also check standard local KDE Connect port 1716 (0x06B4)
-            if (port == 1716 || port == 5353) {
-                is_local = true;
-            }
-
-            bool is_est = (state == 1);
-            add_socket(list, inode, is_est, is_local, port);
-        }
-    }
-
-    fclose(f);
-}
-
+// ============================================================================
+// Process Information, Inode Mapping & PID Reuse Protection
+// ============================================================================
 void get_process_comm(pid_t pid, char *dest, size_t max_len) {
     char comm_path[128];
     snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
@@ -487,50 +517,495 @@ void get_process_comm(pid_t pid, char *dest, size_t max_len) {
     }
 }
 
-bool get_process_io_bytes(pid_t pid, unsigned long long *rchar, unsigned long long *wchar) {
-    char io_path[128];
-    snprintf(io_path, sizeof(io_path), "/proc/%d/io", pid);
+// Extracts starttime (field 22) from /proc/[pid]/stat to detect PID reuse
+bool get_process_starttime(pid_t pid, unsigned long long *starttime) {
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
 
-    FILE *f = fopen(io_path, "r");
+    FILE *f = fopen(path, "r");
     if (!f) return false;
 
-    char line[128];
-    *rchar = 0;
-    *wchar = 0;
-    int matched = 0;
+    char buf[1024];
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
 
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "rchar:", 6) == 0) {
-            *rchar = strtoull(line + 6, NULL, 10);
-            matched++;
-        } else if (strncmp(line, "wchar:", 6) == 0) {
-            *wchar = strtoull(line + 6, NULL, 10);
-            matched++;
-        }
-        if (matched >= 2) break;
+    // /proc/[pid]/stat format: pid (comm) state ...
+    // Since comm can contain spaces and parentheses, locate the LAST closing ')'
+    char *paren = strrchr(buf, ')');
+    if (!paren) return false;
+
+    char *p = paren + 2; // Skip ") "
+    // Starting at field 3 (state, index 0). Field 22 (starttime) is index 19 from here.
+    for (int i = 0; i < 19; i++) {
+        p = strchr(p, ' ');
+        if (!p) return false;
+        p++;
     }
 
-    fclose(f);
-    return (matched >= 2);
+    *starttime = strtoull(p, NULL, 10);
+    return true;
 }
 
-// ==========================================
-// Precise Per-Process Tracking Engine
-// ==========================================
-typedef struct {
+// Inode Map: maps socket inode to (pid, comm)
+typedef struct InodeEntry {
+    unsigned long inode;
     pid_t pid;
     char comm[64];
-    unsigned long long prev_rchar;
-    unsigned long long prev_wchar;
-    unsigned long long delta_rchar;
-    unsigned long long delta_wchar;
-    bool has_network_socket;
-    bool has_active_stream;
-    int local_sockets;
-    int remote_sockets;
-    bool seen;
-} PidSnapshot;
+    struct InodeEntry *next;
+} InodeEntry;
 
+typedef struct {
+    InodeEntry *buckets[INODE_HASH_BUCKETS];
+    InodeEntry pool[MAX_INODE_ENTRIES];
+    size_t pool_count;
+} InodeMap;
+
+void init_inode_map(InodeMap *map) {
+    map->pool_count = 0;
+    memset(map->buckets, 0, sizeof(map->buckets));
+}
+
+void add_inode_mapping(InodeMap *map, unsigned long inode, pid_t pid, const char *comm) {
+    if (map->pool_count >= MAX_INODE_ENTRIES || inode == 0) return;
+
+    size_t b = inode % INODE_HASH_BUCKETS;
+    InodeEntry *e = &map->pool[map->pool_count++];
+    e->inode = inode;
+    e->pid = pid;
+    snprintf(e->comm, sizeof(e->comm), "%s", comm ? comm : "[unknown]");
+    e->next = map->buckets[b];
+    map->buckets[b] = e;
+}
+
+InodeEntry* lookup_inode(const InodeMap *map, unsigned long inode) {
+    if (inode == 0) return NULL;
+    size_t b = inode % INODE_HASH_BUCKETS;
+    for (InodeEntry *e = map->buckets[b]; e != NULL; e = e->next) {
+        if (e->inode == inode) return e;
+    }
+    return NULL;
+}
+
+// Persistent process tracking to guard against PID reuse and track process lifecycle
+typedef struct {
+    pid_t pid;
+    unsigned long long start_time;
+    char comm[64];
+    int unseen_cycles;
+    bool seen;
+} TrackedPid;
+
+// ============================================================================
+// Socket Hash Table & 5-Tuple Matching
+// ============================================================================
+typedef struct SocketHashEntry {
+    uint8_t ip_ver;         // 4 or 6
+    uint8_t protocol;       // IPPROTO_TCP or IPPROTO_UDP
+    uint16_t local_port;    // Host byte order
+    uint16_t remote_port;   // Host byte order
+    union {
+        uint32_t v4;
+        uint8_t v6[16];
+    } local_ip;
+    union {
+        uint32_t v4;
+        uint8_t v6[16];
+    } remote_ip;
+
+    unsigned long inode;
+    pid_t pid;
+    char comm[64];
+    bool is_local;
+
+    struct SocketHashEntry *next_exact;
+    struct SocketHashEntry *next_wildcard;
+} SocketHashEntry;
+
+typedef struct {
+    SocketHashEntry *exact_buckets[SOCKET_HASH_BUCKETS];
+    SocketHashEntry *wildcard_buckets[SOCKET_HASH_BUCKETS];
+    SocketHashEntry pool[MAX_SOCKET_ENTRIES];
+    size_t count;
+} SocketTable;
+
+static inline uint32_t hash_5tuple(uint8_t proto, uint16_t lport, uint16_t rport,
+                                   int ip_ver, const void *lip, const void *rip) {
+    uint32_t h = 2166136261u;
+    h = (h ^ proto) * 16777619u;
+    h = (h ^ (lport & 0xFF)) * 16777619u;
+    h = (h ^ (lport >> 8)) * 16777619u;
+    h = (h ^ (rport & 0xFF)) * 16777619u;
+    h = (h ^ (rport >> 8)) * 16777619u;
+
+    size_t ip_len = (ip_ver == 4) ? 4 : 16;
+    const uint8_t *p1 = (const uint8_t *)lip;
+    const uint8_t *p2 = (const uint8_t *)rip;
+    for (size_t i = 0; i < ip_len; i++) {
+        h = (h ^ p1[i]) * 16777619u;
+        h = (h ^ p2[i]) * 16777619u;
+    }
+    return h;
+}
+
+static inline uint32_t hash_port(uint8_t proto, uint16_t lport) {
+    uint32_t h = 2166136261u;
+    h = (h ^ proto) * 16777619u;
+    h = (h ^ (lport & 0xFF)) * 16777619u;
+    h = (h ^ (lport >> 8)) * 16777619u;
+    return h;
+}
+
+void init_socket_table(SocketTable *table) {
+    table->count = 0;
+    memset(table->exact_buckets, 0, sizeof(table->exact_buckets));
+    memset(table->wildcard_buckets, 0, sizeof(table->wildcard_buckets));
+}
+
+void add_socket_entry(SocketTable *table, uint8_t ip_ver, uint8_t proto,
+                      const void *lip, uint16_t lport,
+                      const void *rip, uint16_t rport,
+                      unsigned long inode, pid_t pid, const char *comm, bool is_local) {
+    if (table->count >= MAX_SOCKET_ENTRIES) return;
+
+    SocketHashEntry *entry = &table->pool[table->count++];
+    entry->ip_ver = ip_ver;
+    entry->protocol = proto;
+    entry->local_port = lport;
+    entry->remote_port = rport;
+    entry->inode = inode;
+    entry->pid = pid;
+    snprintf(entry->comm, sizeof(entry->comm), "%s", comm ? comm : "[unknown]");
+    entry->is_local = is_local;
+    entry->next_exact = NULL;
+    entry->next_wildcard = NULL;
+
+    size_t ip_size = (ip_ver == 4) ? 4 : 16;
+    memcpy(&entry->local_ip, lip, ip_size);
+    memcpy(&entry->remote_ip, rip, ip_size);
+
+    bool is_wildcard_remote = (rport == 0);
+    if (!is_wildcard_remote) {
+        if (ip_ver == 4 && entry->remote_ip.v4 == 0) is_wildcard_remote = true;
+        else if (ip_ver == 6) {
+            bool all_zero = true;
+            for (int i = 0; i < 16; i++) {
+                if (entry->remote_ip.v6[i] != 0) { all_zero = false; break; }
+            }
+            if (all_zero) is_wildcard_remote = true;
+        }
+    }
+
+    if (!is_wildcard_remote) {
+        // Connected socket: add to exact 5-tuple table
+        uint32_t h = hash_5tuple(proto, lport, rport, ip_ver, lip, rip) % SOCKET_HASH_BUCKETS;
+        entry->next_exact = table->exact_buckets[h];
+        table->exact_buckets[h] = entry;
+    } else {
+        // Listening or unconnected UDP socket: add to wildcard port table
+        uint32_t h = hash_port(proto, lport) % SOCKET_HASH_BUCKETS;
+        entry->next_wildcard = table->wildcard_buckets[h];
+        table->wildcard_buckets[h] = entry;
+    }
+}
+
+// ============================================================================
+// Packet Event Structure & Ring Buffer Queue
+// ============================================================================
+typedef struct {
+    uint8_t ip_ver;    // 4 or 6
+    uint8_t proto;     // IPPROTO_TCP or IPPROTO_UDP
+    uint8_t direction; // DIR_TX, DIR_RX, or DIR_UNKNOWN
+    uint32_t length;   // Wire packet length in bytes
+    uint16_t src_port; // Host byte order
+    uint16_t dst_port; // Host byte order
+    union {
+        uint32_t v4;
+        uint8_t v6[16];
+    } src_ip;
+    union {
+        uint32_t v4;
+        uint8_t v6[16];
+    } dst_ip;
+} PacketEvent;
+
+typedef struct {
+    PacketEvent events[PACKET_QUEUE_CAPACITY];
+    size_t head;
+    size_t tail;
+    size_t count;
+    unsigned long long dropped_packets;
+    pthread_mutex_t lock;
+} PacketQueue;
+
+static PacketQueue g_packet_queue;
+
+void init_packet_queue(PacketQueue *queue) {
+    queue->head = 0;
+    queue->tail = 0;
+    queue->count = 0;
+    queue->dropped_packets = 0;
+    pthread_mutex_init(&queue->lock, NULL);
+}
+
+void destroy_packet_queue(PacketQueue *queue) {
+    pthread_mutex_destroy(&queue->lock);
+}
+
+static inline void enqueue_packet(PacketQueue *queue, const PacketEvent *ev) {
+    pthread_mutex_lock(&queue->lock);
+    if (queue->count < PACKET_QUEUE_CAPACITY) {
+        queue->events[queue->tail] = *ev;
+        queue->tail = (queue->tail + 1) % PACKET_QUEUE_CAPACITY;
+        queue->count++;
+    } else {
+        queue->dropped_packets++;
+    }
+    pthread_mutex_unlock(&queue->lock);
+}
+
+size_t dequeue_packet_batch(PacketQueue *queue, PacketEvent *dest, size_t max_items) {
+    pthread_mutex_lock(&queue->lock);
+    size_t n = queue->count < max_items ? queue->count : max_items;
+    for (size_t i = 0; i < n; i++) {
+        dest[i] = queue->events[queue->head];
+        queue->head = (queue->head + 1) % PACKET_QUEUE_CAPACITY;
+    }
+    queue->count -= n;
+    pthread_mutex_unlock(&queue->lock);
+    return n;
+}
+
+// ============================================================================
+// Libpcap Capture Workers
+// ============================================================================
+typedef struct {
+    pcap_t *handle;
+    char if_name[32];
+    int datalink;
+    pthread_t thread;
+    bool active;
+} CaptureSession;
+
+static CaptureSession g_captures[MAX_INTERFACES];
+static size_t g_capture_count = 0;
+
+static void pcap_packet_callback(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes) {
+    CaptureSession *sess = (CaptureSession *)user;
+    if (!bytes || h->caplen < 14) return;
+
+    size_t offset = 0;
+    uint16_t ethertype = 0;
+
+    switch (sess->datalink) {
+        case DLT_EN10MB: // Standard Ethernet
+            if (h->caplen < 14) return;
+            ethertype = ntohs(*(uint16_t *)(bytes + 12));
+            offset = 14;
+            if (ethertype == 0x8100) { // 802.1Q VLAN
+                if (h->caplen < 18) return;
+                ethertype = ntohs(*(uint16_t *)(bytes + 16));
+                offset = 18;
+            }
+            break;
+
+        case DLT_LINUX_SLL: // Linux cooked sockets v1
+            if (h->caplen < 16) return;
+            ethertype = ntohs(*(uint16_t *)(bytes + 14));
+            offset = 16;
+            break;
+
+#ifdef DLT_LINUX_SLL2
+        case DLT_LINUX_SLL2: // Linux cooked sockets v2
+            if (h->caplen < 20) return;
+            ethertype = ntohs(*(uint16_t *)(bytes + 0));
+            offset = 20;
+            break;
+#endif
+
+        case DLT_RAW:
+            offset = 0;
+            ethertype = (bytes[0] >> 4 == 4) ? 0x0800 : 0x86DD;
+            break;
+
+        case DLT_NULL:
+            if (h->caplen < 4) return;
+            offset = 4;
+            ethertype = 0x0800;
+            break;
+
+        default:
+            return;
+    }
+
+    PacketEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.length = h->len; // Actual wire packet length
+
+    if (ethertype == 0x0800) { // IPv4
+        if (h->caplen < offset + 20) return;
+        const u_char *ip = bytes + offset;
+        uint8_t ihl = (ip[0] & 0x0F) * 4;
+        if (ihl < 20 || h->caplen < offset + ihl + 4) return;
+
+        ev.ip_ver = 4;
+        ev.proto = ip[9];
+        if (ev.proto != IPPROTO_TCP && ev.proto != IPPROTO_UDP) return;
+
+        memcpy(&ev.src_ip.v4, ip + 12, 4);
+        memcpy(&ev.dst_ip.v4, ip + 16, 4);
+
+        const u_char *trans = ip + ihl;
+        ev.src_port = ntohs(*(uint16_t *)(trans + 0));
+        ev.dst_port = ntohs(*(uint16_t *)(trans + 2));
+
+        // Determine direction: TX if src is host IP, RX if dst is host IP
+        if (is_host_ipv4(&g_host_ips, ev.src_ip.v4)) {
+            ev.direction = DIR_TX;
+        } else if (is_host_ipv4(&g_host_ips, ev.dst_ip.v4)) {
+            ev.direction = DIR_RX;
+        } else {
+            ev.direction = DIR_UNKNOWN;
+        }
+
+        enqueue_packet(&g_packet_queue, &ev);
+
+    } else if (ethertype == 0x86DD) { // IPv6
+        if (h->caplen < offset + 40 + 4) return;
+        const u_char *ip = bytes + offset;
+
+        ev.ip_ver = 6;
+        ev.proto = ip[6];
+        if (ev.proto != IPPROTO_TCP && ev.proto != IPPROTO_UDP) return;
+
+        memcpy(ev.src_ip.v6, ip + 8, 16);
+        memcpy(ev.dst_ip.v6, ip + 24, 16);
+
+        const u_char *trans = ip + 40;
+        ev.src_port = ntohs(*(uint16_t *)(trans + 0));
+        ev.dst_port = ntohs(*(uint16_t *)(trans + 2));
+
+        if (is_host_ipv6(&g_host_ips, (const struct in6_addr *)ev.src_ip.v6)) {
+            ev.direction = DIR_TX;
+        } else if (is_host_ipv6(&g_host_ips, (const struct in6_addr *)ev.dst_ip.v6)) {
+            ev.direction = DIR_RX;
+        } else {
+            ev.direction = DIR_UNKNOWN;
+        }
+
+        enqueue_packet(&g_packet_queue, &ev);
+    }
+}
+
+static void* pcap_worker_thread(void *arg) {
+    CaptureSession *sess = (CaptureSession *)arg;
+    pcap_loop(sess->handle, -1, pcap_packet_callback, (u_char *)sess);
+    return NULL;
+}
+
+bool start_packet_captures(void) {
+    char errbuf[PCAP_ERRBUF_SIZE] = {0};
+    pcap_if_t *alldevs = NULL;
+
+    if (pcap_findalldevs(&alldevs, errbuf) != 0) {
+        log_message(LOG_ERR, "pcap_findalldevs failed: %s", errbuf);
+        return false;
+    }
+
+    g_capture_count = 0;
+    size_t permission_errors = 0;
+
+    for (pcap_if_t *dev = alldevs; dev != NULL && g_capture_count < MAX_INTERFACES; dev = dev->next) {
+        if (!dev->name) continue;
+        if (is_ignored_interface(dev->name)) continue;
+        if (dev->flags & PCAP_IF_LOOPBACK) continue;
+
+        pcap_t *handle = pcap_create(dev->name, errbuf);
+        if (!handle) {
+            log_message(LOG_WARNING, "pcap_create failed on interface '%s': %s", dev->name, errbuf);
+            continue;
+        }
+
+        // 96-byte snaplen: captures link layer, IP, and TCP/UDP headers without copying payload
+        pcap_set_snaplen(handle, 96);
+        pcap_set_promisc(handle, 0);
+        pcap_set_timeout(handle, 100);
+        pcap_set_immediate_mode(handle, 1);
+        pcap_set_buffer_size(handle, 2 * 1024 * 1024); // 2MB ring buffer to handle bursts
+
+        int status = pcap_activate(handle);
+        if (status != 0) {
+            if (status == PCAP_ERROR_PERM_DENIED || errno == EPERM) {
+                permission_errors++;
+                log_message(LOG_WARNING, "Permission denied capturing on interface '%s'. Requires CAP_NET_RAW or root.", dev->name);
+            } else {
+                log_message(LOG_WARNING, "Failed to activate pcap on '%s': %s", dev->name, pcap_geterr(handle));
+            }
+            pcap_close(handle);
+            continue;
+        }
+
+        // BPF Filter: capture TCP and UDP only
+        struct bpf_program bpf;
+        if (pcap_compile(handle, &bpf, "tcp or udp", 1, PCAP_NETMASK_UNKNOWN) == 0) {
+            pcap_setfilter(handle, &bpf);
+            pcap_freecode(&bpf);
+        }
+
+        CaptureSession *sess = &g_captures[g_capture_count];
+        sess->handle = handle;
+        snprintf(sess->if_name, sizeof(sess->if_name), "%s", dev->name);
+        sess->datalink = pcap_datalink(handle);
+        sess->active = true;
+
+        if (pthread_create(&sess->thread, NULL, pcap_worker_thread, sess) == 0) {
+            g_capture_count++;
+            log_message(LOG_INFO, "Active packet capture started on interface '%s' (datalink: %d).", dev->name, sess->datalink);
+        } else {
+            log_message(LOG_ERR, "Failed to create capture worker thread for '%s'.", dev->name);
+            pcap_close(handle);
+        }
+    }
+
+    pcap_freealldevs(alldevs);
+
+    if (g_capture_count == 0) {
+        if (permission_errors > 0 || geteuid() != 0) {
+            log_message(LOG_ERR, "CRITICAL: Insufficient permissions to capture network packets. Run with CAP_NET_RAW capability or as root.");
+        } else {
+            log_message(LOG_ERR, "CRITICAL: No active network interfaces available for packet capture.");
+        }
+        return false;
+    }
+
+    return true;
+}
+
+void stop_packet_captures(void) {
+    for (size_t i = 0; i < g_capture_count; i++) {
+        if (g_captures[i].active && g_captures[i].handle) {
+            pcap_breakloop(g_captures[i].handle);
+        }
+    }
+
+    for (size_t i = 0; i < g_capture_count; i++) {
+        if (g_captures[i].active) {
+            pthread_join(g_captures[i].thread, NULL);
+            if (g_captures[i].handle) {
+                pcap_close(g_captures[i].handle);
+                g_captures[i].handle = NULL;
+            }
+            g_captures[i].active = false;
+        }
+    }
+    g_capture_count = 0;
+}
+
+// ============================================================================
+// ProcFS Scanning & Socket Table Building
+// ============================================================================
 typedef struct {
     char app_name[64];
     unsigned long long wan_upload;
@@ -542,7 +1017,7 @@ typedef struct {
 typedef struct {
     AppBandwidth apps[MAX_TRACKED_APPS];
     size_t count;
-    PidSnapshot pids[MAX_PIDS];
+    TrackedPid pids[MAX_PIDS];
     size_t pid_count;
 } BandwidthTracker;
 
@@ -554,14 +1029,15 @@ void init_tracker(BandwidthTracker *tracker) {
 }
 
 AppBandwidth* get_or_create_app(BandwidthTracker *tracker, const char *name) {
+    const char *target_name = (name && name[0]) ? name : "[unknown]";
     for (size_t i = 0; i < tracker->count; i++) {
-        if (strcmp(tracker->apps[i].app_name, name) == 0) {
+        if (strcmp(tracker->apps[i].app_name, target_name) == 0) {
             return &tracker->apps[i];
         }
     }
     if (tracker->count < MAX_TRACKED_APPS) {
         size_t idx = tracker->count++;
-        snprintf(tracker->apps[idx].app_name, sizeof(tracker->apps[idx].app_name), "%s", name);
+        snprintf(tracker->apps[idx].app_name, sizeof(tracker->apps[idx].app_name), "%s", target_name);
         tracker->apps[idx].wan_upload = 0;
         tracker->apps[idx].wan_download = 0;
         tracker->apps[idx].lan_upload = 0;
@@ -571,56 +1047,12 @@ AppBandwidth* get_or_create_app(BandwidthTracker *tracker, const char *name) {
     return NULL;
 }
 
-PidSnapshot* get_or_create_pid(BandwidthTracker *tracker, pid_t pid) {
-    for (size_t i = 0; i < tracker->pid_count; i++) {
-        if (tracker->pids[i].pid == pid) {
-            return &tracker->pids[i];
-        }
-    }
-    if (tracker->pid_count < MAX_PIDS) {
-        size_t idx = tracker->pid_count++;
-        tracker->pids[idx].pid = pid;
-        get_process_comm(pid, tracker->pids[idx].comm, sizeof(tracker->pids[idx].comm));
-        tracker->pids[idx].prev_rchar = 0;
-        tracker->pids[idx].prev_wchar = 0;
-        tracker->pids[idx].delta_rchar = 0;
-        tracker->pids[idx].delta_wchar = 0;
-        tracker->pids[idx].has_network_socket = false;
-        tracker->pids[idx].has_active_stream = false;
-        tracker->pids[idx].local_sockets = 0;
-        tracker->pids[idx].remote_sockets = 0;
-        tracker->pids[idx].seen = true;
-        return &tracker->pids[idx];
-    }
-    return NULL;
-}
+// Scans /proc to link socket inodes with processes, validating start_time to prevent PID reuse
+void scan_proc_inodes(InodeMap *map, BandwidthTracker *tracker) {
+    init_inode_map(map);
 
-// Check purely local discovery daemons (KDE Connect daemon, mDNS avahi)
-bool is_known_local_app(const char *comm) {
-    if (!comm) return false;
-    if (strcasecmp(comm, "kdeconnectd") == 0 ||
-        strcasecmp(comm, "avahi-daemon") == 0) {
-        return true;
-    }
-    return false;
-}
-
-double get_process_local_ratio(const PidSnapshot *ps) {
-    if (is_known_local_app(ps->comm)) return 1.0;
-    int total = ps->local_sockets + ps->remote_sockets;
-    if (total == 0) return 0.0;
-    return (double)ps->local_sockets / (double)total;
-}
-
-void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_list) {
     for (size_t i = 0; i < tracker->pid_count; i++) {
         tracker->pids[i].seen = false;
-        tracker->pids[i].has_network_socket = false;
-        tracker->pids[i].has_active_stream = false;
-        tracker->pids[i].local_sockets = 0;
-        tracker->pids[i].remote_sockets = 0;
-        tracker->pids[i].delta_rchar = 0;
-        tracker->pids[i].delta_wchar = 0;
     }
 
     DIR *proc_dir = opendir("/proc");
@@ -633,23 +1065,52 @@ void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_l
         pid_t pid = (pid_t)atoi(proc_entry->d_name);
         if (pid <= 0) continue;
 
+        unsigned long long current_start = 0;
+        if (!get_process_starttime(pid, &current_start)) {
+            continue;
+        }
+
+        // Find or create tracked PID entry
+        TrackedPid *tp = NULL;
+        for (size_t i = 0; i < tracker->pid_count; i++) {
+            if (tracker->pids[i].pid == pid) {
+                tp = &tracker->pids[i];
+                break;
+            }
+        }
+
+        if (tp) {
+            // PID reuse detection: if start_time changed, refresh comm
+            if (tp->start_time != current_start) {
+                tp->start_time = current_start;
+                get_process_comm(pid, tp->comm, sizeof(tp->comm));
+            }
+            tp->seen = true;
+            tp->unseen_cycles = 0;
+        } else if (tracker->pid_count < MAX_PIDS) {
+            tp = &tracker->pids[tracker->pid_count++];
+            tp->pid = pid;
+            tp->start_time = current_start;
+            get_process_comm(pid, tp->comm, sizeof(tp->comm));
+            tp->seen = true;
+            tp->unseen_cycles = 0;
+        }
+
+        const char *comm = tp ? tp->comm : "[unknown]";
+
+        // Scan file descriptors
         char fd_dir_path[256];
         snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%d/fd", pid);
 
         DIR *fd_dir = opendir(fd_dir_path);
         if (!fd_dir) continue;
 
-        bool has_net = false;
-        bool has_active = false;
-        int local_sockets = 0;
-        int remote_sockets = 0;
-
         struct dirent *fd_entry;
         while ((fd_entry = readdir(fd_dir)) != NULL) {
             if (fd_entry->d_name[0] == '.') continue;
 
             char link_path[512];
-            snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%s", pid, fd_entry->d_name);
+            snprintf(link_path, sizeof(link_path), "%s/%s", fd_dir_path, fd_entry->d_name);
 
             char link_target[256];
             ssize_t len = readlink(link_path, link_target, sizeof(link_target) - 1);
@@ -658,142 +1119,237 @@ void sample_process_activity(BandwidthTracker *tracker, const SocketList *sock_l
 
             unsigned long inode = 0;
             if (sscanf(link_target, "socket:[%lu]", &inode) == 1 && inode > 0) {
-                for (size_t s = 0; s < sock_list->count; s++) {
-                    if (sock_list->entries[s].inode == inode) {
-                        has_net = true;
-                        if (sock_list->entries[s].is_established) {
-                            has_active = true;
-                        }
-                        if (sock_list->entries[s].is_local) {
-                            local_sockets++;
-                        } else {
-                            remote_sockets++;
-                        }
-                        break;
-                    }
-                }
+                add_inode_mapping(map, inode, pid, comm);
             }
         }
         closedir(fd_dir);
-
-        if (has_net) {
-            PidSnapshot *ps = get_or_create_pid(tracker, pid);
-            if (ps) {
-                ps->seen = true;
-                ps->has_network_socket = true;
-                ps->has_active_stream = has_active;
-                ps->local_sockets = local_sockets;
-                ps->remote_sockets = remote_sockets;
-
-                unsigned long long rchar = 0, wchar = 0;
-                if (get_process_io_bytes(pid, &rchar, &wchar)) {
-                    if (ps->prev_rchar > 0 && rchar >= ps->prev_rchar) {
-                        ps->delta_rchar = rchar - ps->prev_rchar;
-                    }
-                    if (ps->prev_wchar > 0 && wchar >= ps->prev_wchar) {
-                        ps->delta_wchar = wchar - ps->prev_wchar;
-                    }
-                    ps->prev_rchar = rchar;
-                    ps->prev_wchar = wchar;
-                }
-            }
-        }
     }
     closedir(proc_dir);
-}
 
-void attribute_bandwidth(BandwidthTracker *tracker, unsigned long long delta_rx, unsigned long long delta_tx) {
-    if (delta_rx == 0 && delta_tx == 0) return;
-
-    unsigned long long total_active_rchar = 0;
-    unsigned long long total_active_wchar = 0;
-    int active_stream_count = 0;
-
-    for (size_t i = 0; i < tracker->pid_count; i++) {
-        if (!tracker->pids[i].seen || !tracker->pids[i].has_network_socket) continue;
-
-        if (tracker->pids[i].has_active_stream) {
-            active_stream_count++;
+    // Memory cleanup: prune dead processes not seen for 5 consecutive cycles (5 seconds)
+    size_t i = 0;
+    while (i < tracker->pid_count) {
+        if (!tracker->pids[i].seen) {
+            tracker->pids[i].unseen_cycles++;
+            if (tracker->pids[i].unseen_cycles >= 5) {
+                tracker->pids[i] = tracker->pids[tracker->pid_count - 1];
+                tracker->pid_count--;
+                continue;
+            }
         }
-        total_active_rchar += tracker->pids[i].delta_rchar;
-        total_active_wchar += tracker->pids[i].delta_wchar;
-    }
-
-    // 1. Distribute Download (RX)
-    if (delta_rx > 0) {
-        if (total_active_rchar > 0) {
-            for (size_t i = 0; i < tracker->pid_count; i++) {
-                if (!tracker->pids[i].seen || tracker->pids[i].delta_rchar == 0) continue;
-                unsigned long long share_rx = (delta_rx * tracker->pids[i].delta_rchar) / total_active_rchar;
-                if (share_rx > 0) {
-                    AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
-                    if (app) {
-                        double local_ratio = get_process_local_ratio(&tracker->pids[i]);
-                        unsigned long long lan_rx = (unsigned long long)(share_rx * local_ratio);
-                        unsigned long long wan_rx = share_rx - lan_rx;
-                        app->lan_download += lan_rx;
-                        app->wan_download += wan_rx;
-                    }
-                }
-            }
-        } else if (active_stream_count > 0) {
-            unsigned long long share_rx = delta_rx / active_stream_count;
-            for (size_t i = 0; i < tracker->pid_count; i++) {
-                if (tracker->pids[i].seen && tracker->pids[i].has_active_stream) {
-                    AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
-                    if (app) {
-                        double local_ratio = get_process_local_ratio(&tracker->pids[i]);
-                        unsigned long long lan_rx = (unsigned long long)(share_rx * local_ratio);
-                        unsigned long long wan_rx = share_rx - lan_rx;
-                        app->lan_download += lan_rx;
-                        app->wan_download += wan_rx;
-                    }
-                }
-            }
-        } else {
-            AppBandwidth *app = get_or_create_app(tracker, "system-network");
-            if (app) app->wan_download += delta_rx;
-        }
-    }
-
-    // 2. Distribute Upload (TX)
-    if (delta_tx > 0) {
-        if (total_active_wchar > 0) {
-            for (size_t i = 0; i < tracker->pid_count; i++) {
-                if (!tracker->pids[i].seen || tracker->pids[i].delta_wchar == 0) continue;
-                unsigned long long share_tx = (delta_tx * tracker->pids[i].delta_wchar) / total_active_wchar;
-                if (share_tx > 0) {
-                    AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
-                    if (app) {
-                        double local_ratio = get_process_local_ratio(&tracker->pids[i]);
-                        unsigned long long lan_tx = (unsigned long long)(share_tx * local_ratio);
-                        unsigned long long wan_tx = share_tx - lan_tx;
-                        app->lan_upload += lan_tx;
-                        app->wan_upload += wan_tx;
-                    }
-                }
-            }
-        } else if (active_stream_count > 0) {
-            unsigned long long share_tx = delta_tx / active_stream_count;
-            for (size_t i = 0; i < tracker->pid_count; i++) {
-                if (tracker->pids[i].seen && tracker->pids[i].has_active_stream) {
-                    AppBandwidth *app = get_or_create_app(tracker, tracker->pids[i].comm);
-                    if (app) {
-                        double local_ratio = get_process_local_ratio(&tracker->pids[i]);
-                        unsigned long long lan_tx = (unsigned long long)(share_tx * local_ratio);
-                        unsigned long long wan_tx = share_tx - lan_tx;
-                        app->lan_upload += lan_tx;
-                        app->wan_upload += wan_tx;
-                    }
-                }
-            }
-        } else {
-            AppBandwidth *app = get_or_create_app(tracker, "system-network");
-            if (app) app->wan_upload += delta_tx;
-        }
+        i++;
     }
 }
 
+// Parses /proc/net/tcp, tcp6, udp, udp6 and populates the SocketTable
+void parse_proc_net_file(const char *path, uint8_t ip_ver, uint8_t proto,
+                         const InodeMap *inode_map, SocketTable *table) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[BUFFER_SIZE];
+    if (!fgets(line, sizeof(line), f)) {
+        fclose(f);
+        return;
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long inode = 0;
+        char local_addr_str[128], rem_addr_str[128];
+        unsigned int state = 0;
+        unsigned long tx_q = 0, rx_q = 0;
+        int dummy_d1 = 0, dummy_d2 = 0;
+        unsigned long dummy_ul1 = 0, dummy_ul2 = 0, dummy_ul3 = 0;
+
+        int num_matched = sscanf(line,
+               "%*d: %127s %127s %x %lx:%lx %lx:%lx %lx %d %d %lu",
+               local_addr_str, rem_addr_str, &state, &tx_q, &rx_q,
+               &dummy_ul1, &dummy_ul2, &dummy_ul3,
+               &dummy_d1, &dummy_d2, &inode);
+
+        if (num_matched >= 11 && inode > 0) {
+            char *colon_loc = strchr(local_addr_str, ':');
+            char *colon_rem = strchr(rem_addr_str, ':');
+            if (!colon_loc || !colon_rem) continue;
+
+            *colon_loc = '\0';
+            *colon_rem = '\0';
+
+            unsigned int lport = 0, rport = 0;
+            sscanf(colon_loc + 1, "%x", &lport);
+            sscanf(colon_rem + 1, "%x", &rport);
+
+            union { uint32_t v4; uint8_t v6[16]; } lip;
+            union { uint32_t v4; uint8_t v6[16]; } rip;
+            memset(&lip, 0, sizeof(lip));
+            memset(&rip, 0, sizeof(rip));
+
+            if (ip_ver == 4) {
+                unsigned int raw_lip = 0, raw_rip = 0;
+                sscanf(local_addr_str, "%x", &raw_lip);
+                sscanf(rem_addr_str, "%x", &raw_rip);
+                lip.v4 = raw_lip;
+                rip.v4 = raw_rip;
+            } else {
+                for (int w = 0; w < 4; w++) {
+                    unsigned int word_l = 0, word_r = 0;
+                    char wstr_l[9] = {0}, wstr_r[9] = {0};
+                    memcpy(wstr_l, local_addr_str + (w * 8), 8);
+                    memcpy(wstr_r, rem_addr_str + (w * 8), 8);
+                    wstr_l[8] = '\0';
+                    wstr_r[8] = '\0';
+                    sscanf(wstr_l, "%x", &word_l);
+                    sscanf(wstr_r, "%x", &word_r);
+                    lip.v6[w * 4 + 0] = (word_l >> 0) & 0xFF;
+                    lip.v6[w * 4 + 1] = (word_l >> 8) & 0xFF;
+                    lip.v6[w * 4 + 2] = (word_l >> 16) & 0xFF;
+                    lip.v6[w * 4 + 3] = (word_l >> 24) & 0xFF;
+                    rip.v6[w * 4 + 0] = (word_r >> 0) & 0xFF;
+                    rip.v6[w * 4 + 1] = (word_r >> 8) & 0xFF;
+                    rip.v6[w * 4 + 2] = (word_r >> 16) & 0xFF;
+                    rip.v6[w * 4 + 3] = (word_r >> 24) & 0xFF;
+                }
+            }
+
+            bool is_local = is_hex_ip_local(rem_addr_str);
+            if (rport == 1716 || rport == 5353) {
+                is_local = true;
+            }
+
+            InodeEntry *ie = lookup_inode(inode_map, inode);
+            pid_t pid = ie ? ie->pid : 0;
+            const char *comm = ie ? ie->comm : "system-network";
+
+            add_socket_entry(table, ip_ver, proto,
+                             &lip, (uint16_t)lport,
+                             &rip, (uint16_t)rport,
+                             inode, pid, comm, is_local);
+        }
+    }
+
+    fclose(f);
+}
+
+void build_socket_table(SocketTable *table, const InodeMap *inode_map) {
+    init_socket_table(table);
+    parse_proc_net_file("/proc/net/tcp", 4, IPPROTO_TCP, inode_map, table);
+    parse_proc_net_file("/proc/net/tcp6", 6, IPPROTO_TCP, inode_map, table);
+    parse_proc_net_file("/proc/net/udp", 4, IPPROTO_UDP, inode_map, table);
+    parse_proc_net_file("/proc/net/udp6", 6, IPPROTO_UDP, inode_map, table);
+}
+
+// ============================================================================
+// Packet to Socket Matching & Aggregation
+// ============================================================================
+static SocketHashEntry* match_candidate_socket(const SocketTable *table,
+                                               uint8_t ip_ver, uint8_t proto,
+                                               const void *cand_lip, uint16_t cand_lport,
+                                               const void *cand_rip, uint16_t cand_rport) {
+    size_t ip_size = (ip_ver == 4) ? 4 : 16;
+
+    // 1. Exact 5-tuple lookup
+    uint32_t h_exact = hash_5tuple(proto, cand_lport, cand_rport, ip_ver, cand_lip, cand_rip) % SOCKET_HASH_BUCKETS;
+    for (SocketHashEntry *e = table->exact_buckets[h_exact]; e != NULL; e = e->next_exact) {
+        if (e->ip_ver == ip_ver && e->protocol == proto &&
+            e->local_port == cand_lport && e->remote_port == cand_rport &&
+            memcmp(&e->local_ip, cand_lip, ip_size) == 0 &&
+            memcmp(&e->remote_ip, cand_rip, ip_size) == 0) {
+            return e;
+        }
+    }
+
+    // 2. Wildcard port lookup (unconnected UDP or listening socket)
+    uint32_t h_wild = hash_port(proto, cand_lport) % SOCKET_HASH_BUCKETS;
+    SocketHashEntry *best_match = NULL;
+    for (SocketHashEntry *e = table->wildcard_buckets[h_wild]; e != NULL; e = e->next_wildcard) {
+        if (e->ip_ver == ip_ver && e->protocol == proto && e->local_port == cand_lport) {
+            // Check if local IP matches, or if socket bound to INADDR_ANY (all zeros)
+            if (memcmp(&e->local_ip, cand_lip, ip_size) == 0) {
+                return e; // Exact local IP match on listening socket
+            }
+            if (!best_match) {
+                best_match = e; // Wildcard bound fallback
+            }
+        }
+    }
+
+    return best_match;
+}
+
+void process_packet_event(BandwidthTracker *tracker, const SocketTable *table, const PacketEvent *ev) {
+    SocketHashEntry *matched = NULL;
+    int resolved_dir = ev->direction;
+    const void *rem_ip = NULL;
+
+    if (ev->direction == DIR_TX) {
+        matched = match_candidate_socket(table, ev->ip_ver, ev->proto,
+                                         &ev->src_ip, ev->src_port,
+                                         &ev->dst_ip, ev->dst_port);
+        rem_ip = &ev->dst_ip;
+    } else if (ev->direction == DIR_RX) {
+        matched = match_candidate_socket(table, ev->ip_ver, ev->proto,
+                                         &ev->dst_ip, ev->dst_port,
+                                         &ev->src_ip, ev->src_port);
+        rem_ip = &ev->src_ip;
+    } else {
+        // Unknown direction: try TX assumption first, then RX
+        matched = match_candidate_socket(table, ev->ip_ver, ev->proto,
+                                         &ev->src_ip, ev->src_port,
+                                         &ev->dst_ip, ev->dst_port);
+        if (matched) {
+            resolved_dir = DIR_TX;
+            rem_ip = &ev->dst_ip;
+        } else {
+            matched = match_candidate_socket(table, ev->ip_ver, ev->proto,
+                                             &ev->dst_ip, ev->dst_port,
+                                             &ev->src_ip, ev->src_port);
+            if (matched) {
+                resolved_dir = DIR_RX;
+                rem_ip = &ev->src_ip;
+            } else {
+                resolved_dir = DIR_RX;
+                rem_ip = &ev->src_ip;
+            }
+        }
+    }
+
+    const char *app_name = matched ? matched->comm : "system-network";
+    AppBandwidth *app = get_or_create_app(tracker, app_name);
+    if (!app) return;
+
+    // Determine LAN vs WAN from the remote IP of the actual captured packet
+    bool is_local = false;
+    if (ev->ip_ver == 4) {
+        uint32_t rip_v4 = *(const uint32_t *)rem_ip;
+        is_local = is_ipv4_local(rip_v4);
+    } else {
+        is_local = is_ipv6_local((const unsigned char *)rem_ip);
+    }
+
+    uint16_t rem_port = (resolved_dir == DIR_TX) ? ev->dst_port : ev->src_port;
+    if (rem_port == 1716 || rem_port == 5353) {
+        is_local = true;
+    }
+
+    // Direct aggregation: accumulate exact wire bytes into the appropriate bucket
+    if (resolved_dir == DIR_TX) {
+        if (is_local) {
+            app->lan_upload += ev->length;
+        } else {
+            app->wan_upload += ev->length;
+        }
+    } else {
+        if (is_local) {
+            app->lan_download += ev->length;
+        } else {
+            app->wan_download += ev->length;
+        }
+    }
+}
+
+// ============================================================================
+// Database Persistence (Batch Commit)
+// ============================================================================
 bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
     if (!database->db || !database->insert_stmt) return false;
 
@@ -818,7 +1374,7 @@ bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
             sqlite3_bind_text(database->insert_stmt, 1, tracker->apps[i].app_name, -1, SQLITE_STATIC);
             sqlite3_bind_int64(database->insert_stmt, 2, (sqlite3_int64)tracker->apps[i].wan_upload);
             sqlite3_bind_int64(database->insert_stmt, 3, (sqlite3_int64)tracker->apps[i].wan_download);
-            sqlite3_bind_int(database->insert_stmt, 4, 0);
+            sqlite3_bind_int(database->insert_stmt, 4, 0); // is_local = 0 (WAN)
 
             sqlite3_step(database->insert_stmt);
 
@@ -833,7 +1389,7 @@ bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
             sqlite3_bind_text(database->insert_stmt, 1, tracker->apps[i].app_name, -1, SQLITE_STATIC);
             sqlite3_bind_int64(database->insert_stmt, 2, (sqlite3_int64)tracker->apps[i].lan_upload);
             sqlite3_bind_int64(database->insert_stmt, 3, (sqlite3_int64)tracker->apps[i].lan_download);
-            sqlite3_bind_int(database->insert_stmt, 4, 1);
+            sqlite3_bind_int(database->insert_stmt, 4, 1); // is_local = 1 (LAN)
 
             sqlite3_step(database->insert_stmt);
 
@@ -846,6 +1402,9 @@ bool flush_tracker_to_db(Database *database, BandwidthTracker *tracker) {
     return true;
 }
 
+// ============================================================================
+// Formatting Helpers
+// ============================================================================
 void format_bytes(unsigned long long bytes, char *buffer, size_t buflen) {
     if (bytes >= 1024ULL * 1024ULL * 1024ULL) {
         snprintf(buffer, buflen, "%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
@@ -880,9 +1439,85 @@ unsigned long long parse_size_string(const char *str) {
     return (unsigned long long)val;
 }
 
-// ==========================================
+// ============================================================================
+// Daemon Background Collector
+// ============================================================================
+void run_daemon_collector(Database *db) {
+    log_message(LOG_INFO, "NetMonitor actual packet capture collector started (DB: %s).", db->db_path);
+
+    init_packet_queue(&g_packet_queue);
+    update_host_ips(&g_host_ips);
+
+    if (!start_packet_captures()) {
+        log_message(LOG_ERR, "Failed to start packet captures. Exiting collector.");
+        destroy_packet_queue(&g_packet_queue);
+        return;
+    }
+
+    BandwidthTracker tracker;
+    init_tracker(&tracker);
+
+    static InodeMap inode_map;
+    static SocketTable socket_table;
+
+    // Perform initial socket table build
+    scan_proc_inodes(&inode_map, &tracker);
+    build_socket_table(&socket_table, &inode_map);
+
+    time_t last_flush_time = time(NULL);
+    time_t last_scan_time = time(NULL);
+
+    PacketEvent batch[BATCH_DEQUEUE_SIZE];
+
+    while (keep_running) {
+        usleep(100000); // 100ms processing cadence to minimize latency and CPU usage
+
+        // Drain available packets from the ring buffer
+        size_t n = 0;
+        while ((n = dequeue_packet_batch(&g_packet_queue, batch, BATCH_DEQUEUE_SIZE)) > 0) {
+            for (size_t i = 0; i < n; i++) {
+                process_packet_event(&tracker, &socket_table, &batch[i]);
+            }
+        }
+
+        time_t now = time(NULL);
+
+        // Periodically refresh host IPs, inode map, and socket table (every 1 second)
+        if (now - last_scan_time >= 1) {
+            update_host_ips(&g_host_ips);
+            scan_proc_inodes(&inode_map, &tracker);
+            build_socket_table(&socket_table, &inode_map);
+            last_scan_time = now;
+        }
+
+        // Commit periodic batch to SQLite (every 60 seconds)
+        if (now - last_flush_time >= BATCH_INTERVAL_SECONDS) {
+            if (flush_tracker_to_db(db, &tracker)) {
+                log_message(LOG_INFO, "Committed periodic network consumption batch to SQLite.");
+            }
+            last_flush_time = now;
+        }
+    }
+
+    log_message(LOG_INFO, "Shutting down packet capture workers...");
+    stop_packet_captures();
+
+    // Drain any remaining packets in queue
+    size_t n = 0;
+    while ((n = dequeue_packet_batch(&g_packet_queue, batch, BATCH_DEQUEUE_SIZE)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            process_packet_event(&tracker, &socket_table, &batch[i]);
+        }
+    }
+
+    flush_tracker_to_db(db, &tracker);
+    destroy_packet_queue(&g_packet_queue);
+    log_message(LOG_INFO, "NetMonitor background collector stopped gracefully.");
+}
+
+// ============================================================================
 // SQL Query & CLI Filter Handler
-// ==========================================
+// ============================================================================
 typedef struct {
     bool time_filter_active;
     char time_clause[128];
@@ -895,9 +1530,9 @@ typedef struct {
 } CliOptions;
 
 void print_help(const char *prog_name) {
-    printf("=========================================================================\n");
-    printf("     Network Usage Monitor - Command Line Interface (CLI)                \n");
-    printf("=========================================================================\n");
+    printf("===================================================================================================\n");
+    printf("     NetMonitor - Accurate Packet-Captured Network Usage Monitor (CLI)                             \n");
+    printf("===================================================================================================\n");
     printf("Usage: %s [OPTIONS]\n\n", prog_name);
     printf("Time Filtering Options (Executed in SQL):\n");
     printf("  --last-minute [N]           Show usage from last N minutes (default N=1)\n");
@@ -909,6 +1544,8 @@ void print_help(const char *prog_name) {
     printf("Size Filtering & Sorting (Executed in SQL):\n");
     printf("      --min <SIZE>            Filter apps with traffic >= size (e.g., 200M, 1G, 500K)\n");
     printf("  -s, --sort <asc|desc>       Sort results by total consumption (default: desc)\n\n");
+    printf("Network Classification Options:\n");
+    printf("      --cgnat-local           Treat CGNAT (100.64.0.0/10) as local LAN traffic (e.g. Tailscale)\n\n");
     printf("Database Management:\n");
     printf("      --clear, --reset        Clear / reset all historical records from database\n\n");
     printf("Daemon & Execution Modes:\n");
@@ -921,11 +1558,11 @@ void print_help(const char *prog_name) {
     printf("  %s --last-week 4 --min 200M\n", prog_name);
     printf("  %s --custom \"2026-09-24\" --sort asc\n", prog_name);
     printf("  %s --clear\n", prog_name);
-    printf("=========================================================================\n");
+    printf("===================================================================================================\n");
 }
 
 void query_database(Database *database, const CliOptions *opts) {
-    char sql[1024];
+    char sql[1536];
     char where_clause[512] = "";
     char having_clause[256] = "";
 
@@ -939,11 +1576,14 @@ void query_database(Database *database, const CliOptions *opts) {
 
     const char *order_dir = opts->sort_asc ? "ASC" : "DESC";
 
+    // Conditional SQL aggregation cleanly separates WAN and LAN columns in a single query
     snprintf(sql,
              sizeof(sql),
              "SELECT app_name, "
-             "       SUM(bytes_sent) AS total_upload, "
-             "       SUM(bytes_received) AS total_download, "
+             "       SUM(CASE WHEN is_local = 0 THEN bytes_received ELSE 0 END) AS wan_download, "
+             "       SUM(CASE WHEN is_local = 0 THEN bytes_sent ELSE 0 END) AS wan_upload, "
+             "       SUM(CASE WHEN is_local = 1 THEN bytes_received ELSE 0 END) AS lan_download, "
+             "       SUM(CASE WHEN is_local = 1 THEN bytes_sent ELSE 0 END) AS lan_upload, "
              "       SUM(bytes_sent + bytes_received) AS total_bytes, "
              "       COUNT(*) AS entries_count, "
              "       MAX(timestamp) AS last_seen "
@@ -961,9 +1601,9 @@ void query_database(Database *database, const CliOptions *opts) {
         return;
     }
 
-    printf("\n===================================================================================================\n");
-    printf("                                   DATABASE QUERY RESULTS                                          \n");
-    printf("===================================================================================================\n");
+    printf("\n=============================================================================================================================\n");
+    printf("                                              DATABASE QUERY RESULTS                                                         \n");
+    printf("=============================================================================================================================\n");
     printf(" Database: %s\n", database->db_path);
     printf(" Filter  : %s\n", opts->time_filter_active ? opts->time_description : "All Recorded Time");
     if (opts->min_bytes > 0) {
@@ -972,173 +1612,87 @@ void query_database(Database *database, const CliOptions *opts) {
         printf(" Min Size: >= %s\n", min_str);
     }
     printf(" Sort    : Total Bytes %s\n", order_dir);
-    printf("---------------------------------------------------------------------------------------------------\n");
-    printf("%-24s %-16s %-16s %-16s %-10s %-20s\n",
-           "APPLICATION", "UPLOAD (TX)", "DOWNLOAD (RX)", "TOTAL USAGE", "SAMPLES", "LAST SEEN");
-    printf("---------------------------------------------------------------------------------------------------\n");
+    printf("-----------------------------------------------------------------------------------------------------------------------------\n");
+    printf("%-20s %-15s %-15s %-15s %-15s %-15s %-9s %-19s\n",
+           "APPLICATION", "WAN DOWNLOAD", "WAN UPLOAD", "LAN DOWNLOAD", "LAN UPLOAD", "TOTAL USAGE", "SAMPLES", "LAST SEEN");
+    printf("-----------------------------------------------------------------------------------------------------------------------------\n");
 
     int row_count = 0;
-    unsigned long long grand_total_upload = 0;
-    unsigned long long grand_total_download = 0;
+    unsigned long long grand_wan_down = 0;
+    unsigned long long grand_wan_up = 0;
+    unsigned long long grand_lan_down = 0;
+    unsigned long long grand_lan_up = 0;
+    unsigned long long grand_total = 0;
 
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const unsigned char *app = sqlite3_column_text(stmt, 0);
-        unsigned long long upload = (unsigned long long)sqlite3_column_int64(stmt, 1);
-        unsigned long long download = (unsigned long long)sqlite3_column_int64(stmt, 2);
-        unsigned long long total = (unsigned long long)sqlite3_column_int64(stmt, 3);
-        int samples = sqlite3_column_int(stmt, 4);
-        const unsigned char *last_seen = sqlite3_column_text(stmt, 5);
+        unsigned long long wan_down = (unsigned long long)sqlite3_column_int64(stmt, 1);
+        unsigned long long wan_up   = (unsigned long long)sqlite3_column_int64(stmt, 2);
+        unsigned long long lan_down = (unsigned long long)sqlite3_column_int64(stmt, 3);
+        unsigned long long lan_up   = (unsigned long long)sqlite3_column_int64(stmt, 4);
+        unsigned long long total    = (unsigned long long)sqlite3_column_int64(stmt, 5);
+        int samples = sqlite3_column_int(stmt, 6);
+        const unsigned char *last_seen = sqlite3_column_text(stmt, 7);
 
-        char upload_str[32], download_str[32], total_str[32];
-        format_bytes(upload, upload_str, sizeof(upload_str));
-        format_bytes(download, download_str, sizeof(download_str));
+        char wan_down_str[32], wan_up_str[32];
+        char lan_down_str[32], lan_up_str[32];
+        char total_str[32];
+
+        format_bytes(wan_down, wan_down_str, sizeof(wan_down_str));
+        format_bytes(wan_up, wan_up_str, sizeof(wan_up_str));
+        format_bytes(lan_down, lan_down_str, sizeof(lan_down_str));
+        format_bytes(lan_up, lan_up_str, sizeof(lan_up_str));
         format_bytes(total, total_str, sizeof(total_str));
 
-        printf("%-24s %-16s %-16s %-16s %-10d %-20s\n",
+        printf("%-20s %-15s %-15s %-15s %-15s %-15s %-9d %-19s\n",
                app ? (const char *)app : "[unknown]",
-               upload_str,
-               download_str,
+               wan_down_str,
+               wan_up_str,
+               lan_down_str,
+               lan_up_str,
                total_str,
                samples,
                last_seen ? (const char *)last_seen : "-");
 
-        grand_total_upload += upload;
-        grand_total_download += download;
+        grand_wan_down += wan_down;
+        grand_wan_up   += wan_up;
+        grand_lan_down += lan_down;
+        grand_lan_up   += lan_up;
+        grand_total    += total;
         row_count++;
     }
     sqlite3_finalize(stmt);
 
     if (row_count == 0) {
         printf("  No matching records found in database for the given criteria.\n");
-        printf("===================================================================================================\n\n");
+        printf("=============================================================================================================================\n\n");
         return;
     }
 
-    printf("---------------------------------------------------------------------------------------------------\n");
-    char total_up_str[32], total_down_str[32], grand_total_str[32];
-    format_bytes(grand_total_upload, total_up_str, sizeof(total_up_str));
-    format_bytes(grand_total_download, total_down_str, sizeof(total_down_str));
-    format_bytes(grand_total_upload + grand_total_download, grand_total_str, sizeof(grand_total_str));
+    printf("-----------------------------------------------------------------------------------------------------------------------------\n");
+    char g_wdown_str[32], g_wup_str[32], g_ldown_str[32], g_lup_str[32], g_tot_str[32];
+    format_bytes(grand_wan_down, g_wdown_str, sizeof(g_wdown_str));
+    format_bytes(grand_wan_up, g_wup_str, sizeof(g_wup_str));
+    format_bytes(grand_lan_down, g_ldown_str, sizeof(g_ldown_str));
+    format_bytes(grand_lan_up, g_lup_str, sizeof(g_lup_str));
+    format_bytes(grand_total, g_tot_str, sizeof(g_tot_str));
 
-    printf("%-24s %-16s %-16s %-16s Total Rows: %d\n",
-           "TOTAL AGGREGATED", total_up_str, total_down_str, grand_total_str, row_count);
-    printf("---------------------------------------------------------------------------------------------------\n");
+    printf("%-20s %-15s %-15s %-15s %-15s %-15s Total Apps: %d\n",
+           "TOTAL AGGREGATED", g_wdown_str, g_wup_str, g_ldown_str, g_lup_str, g_tot_str, row_count);
+    printf("-----------------------------------------------------------------------------------------------------------------------------\n");
 
-    char split_sql[1024];
-    snprintf(split_sql,
-             sizeof(split_sql),
-             "SELECT is_local, "
-             "       SUM(bytes_sent) AS sum_sent, "
-             "       SUM(bytes_received) AS sum_recv, "
-             "       SUM(bytes_sent + bytes_received) AS sum_total "
-             "FROM network_usage "
-             "%s "
-             "GROUP BY is_local;",
-             where_clause);
-
-    sqlite3_stmt *split_stmt = NULL;
-    unsigned long long wan_up = 0, wan_down = 0, wan_tot = 0;
-    unsigned long long lan_up = 0, lan_down = 0, lan_tot = 0;
-
-    if (sqlite3_prepare_v2(database->db, split_sql, -1, &split_stmt, NULL) == SQLITE_OK) {
-        while (sqlite3_step(split_stmt) == SQLITE_ROW) {
-            int is_local = sqlite3_column_int(split_stmt, 0);
-            unsigned long long s_up = (unsigned long long)sqlite3_column_int64(split_stmt, 1);
-            unsigned long long s_down = (unsigned long long)sqlite3_column_int64(split_stmt, 2);
-            unsigned long long s_tot = (unsigned long long)sqlite3_column_int64(split_stmt, 3);
-
-            if (is_local == 1) {
-                lan_up = s_up;
-                lan_down = s_down;
-                lan_tot = s_tot;
-            } else {
-                wan_up = s_up;
-                wan_down = s_down;
-                wan_tot = s_tot;
-            }
-        }
-        sqlite3_finalize(split_stmt);
-    }
-
-    char wan_tot_str[32], wan_up_str[32], wan_down_str[32];
-    char lan_tot_str[32], lan_up_str[32], lan_down_str[32];
-
+    unsigned long long wan_tot = grand_wan_down + grand_wan_up;
+    unsigned long long lan_tot = grand_lan_down + grand_lan_up;
+    char wan_tot_str[32], lan_tot_str[32];
     format_bytes(wan_tot, wan_tot_str, sizeof(wan_tot_str));
-    format_bytes(wan_up, wan_up_str, sizeof(wan_up_str));
-    format_bytes(wan_down, wan_down_str, sizeof(wan_down_str));
-
     format_bytes(lan_tot, lan_tot_str, sizeof(lan_tot_str));
-    format_bytes(lan_up, lan_up_str, sizeof(lan_up_str));
-    format_bytes(lan_down, lan_down_str, sizeof(lan_down_str));
 
-    printf("  🌐 Internet / WAN (Quota Usage) : %-10s (Upload: %-9s | Download: %-9s)\n",
-           wan_tot_str, wan_up_str, wan_down_str);
-    printf("  🏠 Local / LAN    (Network Sharing): %-10s (Upload: %-9s | Download: %-9s)\n",
-           lan_tot_str, lan_up_str, lan_down_str);
+    printf("  🌐 Internet / WAN (Quota Usage)    : %-10s (Download: %-9s | Upload: %-9s)\n",
+           wan_tot_str, g_wdown_str, g_wup_str);
+    printf("  🏠 Local / LAN    (Network Sharing): %-10s (Download: %-9s | Upload: %-9s)\n",
+           lan_tot_str, g_ldown_str, g_lup_str);
 
-    printf("===================================================================================================\n\n");
-}
-
-void run_daemon_collector(Database *db) {
-    log_message(LOG_INFO, "NetMonitor continuous background collector started (DB: %s).", db->db_path);
-
-    BandwidthTracker tracker;
-    init_tracker(&tracker);
-
-    TotalNetStats prev_stats = {0};
-    bool has_prev = get_all_interfaces_stats(&prev_stats);
-
-    time_t last_flush_time = time(NULL);
-
-    while (keep_running) {
-        sleep(1);
-
-        TotalNetStats curr_stats = {0};
-        bool has_curr = get_all_interfaces_stats(&curr_stats);
-
-        if (has_prev && has_curr) {
-            unsigned long long delta_rx = 0;
-            unsigned long long delta_tx = 0;
-
-            if (curr_stats.rx_bytes >= prev_stats.rx_bytes) {
-                delta_rx = curr_stats.rx_bytes - prev_stats.rx_bytes;
-            }
-            if (curr_stats.tx_bytes >= prev_stats.tx_bytes) {
-                delta_tx = curr_stats.tx_bytes - prev_stats.tx_bytes;
-            }
-
-            if (delta_rx > 0 || delta_tx > 0) {
-                SocketList sock_list;
-                init_socket_list(&sock_list);
-
-                parse_proc_net_file("/proc/net/tcp", &sock_list);
-                parse_proc_net_file("/proc/net/tcp6", &sock_list);
-                parse_proc_net_file("/proc/net/udp", &sock_list);
-                parse_proc_net_file("/proc/net/udp6", &sock_list);
-
-                sample_process_activity(&tracker, &sock_list);
-                attribute_bandwidth(&tracker, delta_rx, delta_tx);
-
-                free_socket_list(&sock_list);
-            }
-        }
-
-        if (has_curr) {
-            prev_stats = curr_stats;
-            has_prev = true;
-        }
-
-        time_t now = time(NULL);
-        if (now - last_flush_time >= BATCH_INTERVAL_SECONDS) {
-            if (flush_tracker_to_db(db, &tracker)) {
-                log_message(LOG_INFO, "Committed periodic network consumption batch to SQLite.");
-            }
-            last_flush_time = now;
-        }
-    }
-
-    flush_tracker_to_db(db, &tracker);
-    log_message(LOG_INFO, "NetMonitor background collector stopped gracefully.");
+    printf("=============================================================================================================================\n\n");
 }
 
 int get_optional_numeric_arg(int argc, char *argv[]) {
@@ -1156,6 +1710,9 @@ int get_optional_numeric_arg(int argc, char *argv[]) {
     return 1;
 }
 
+// ============================================================================
+// Main Entrypoint
+// ============================================================================
 int main(int argc, char *argv[]) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
@@ -1167,14 +1724,16 @@ int main(int argc, char *argv[]) {
         .min_bytes = 0,
         .sort_asc = false,
         .run_daemon = false,
-        .record_snapshot = false
+        .record_snapshot = false,
+        .clear_history = false
     };
 
     enum {
         OPT_LAST_MINUTE = 1000,
         OPT_LAST_HOUR,
         OPT_MIN_SIZE,
-        OPT_CLEAR
+        OPT_CLEAR,
+        OPT_CGNAT_LOCAL
     };
 
     static struct option long_options[] = {
@@ -1187,12 +1746,20 @@ int main(int argc, char *argv[]) {
         {"custom",      required_argument, 0, 'c'},
         {"min",         required_argument, 0, OPT_MIN_SIZE},
         {"sort",        required_argument, 0, 's'},
+        {"cgnat-local", no_argument,       0, OPT_CGNAT_LOCAL},
         {"clear",       no_argument,       0, OPT_CLEAR},
         {"reset",       no_argument,       0, OPT_CLEAR},
         {"daemon",      no_argument,       0, 'D'},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "clear") == 0 || strcmp(argv[i], "reset") == 0) {
+            opts.clear_history = true;
+            break;
+        }
+    }
 
     int opt;
     int option_index = 0;
@@ -1265,6 +1832,10 @@ int main(int argc, char *argv[]) {
                         return 1;
                     }
                 }
+                break;
+
+            case OPT_CGNAT_LOCAL:
+                config_treat_cgnat_as_local = true;
                 break;
 
             case OPT_CLEAR:
