@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=NetMonitor
+GenericName=Network Bandwidth Monitor
+Comment=Real-time packet-captured Linux network bandwidth analytics (WAN vs LAN)
+Exec=/home/abdallah_mamdouh/Projects/NetMonitor/netmon_gui.py
+Icon=/home/abdallah_mamdouh/Projects/NetMonitor/assets/netmon.png
+Terminal=false
+Categories=Network;System;Monitor;
+Keywords=network;bandwidth;traffic;usage;monitor;wan;lan;nethogs;
+StartupNotify=true
+StartupWMClass=NetMonitor

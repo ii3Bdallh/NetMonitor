@@ -208,7 +208,8 @@ bool init_database(Database *database, bool for_writing) {
             "  timestamp DATETIME DEFAULT (datetime('now', 'localtime'))"
             ");"
             "CREATE INDEX IF NOT EXISTS idx_app_time ON network_usage(app_name, timestamp);"
-            "CREATE INDEX IF NOT EXISTS idx_local_time ON network_usage(is_local, timestamp);";
+            "CREATE INDEX IF NOT EXISTS idx_local_time ON network_usage(is_local, timestamp);"
+            "CREATE INDEX IF NOT EXISTS idx_timestamp ON network_usage(timestamp);";
 
         char *err_msg = NULL;
         rc = sqlite3_exec(database->db, create_table_sql, NULL, NULL, &err_msg);
@@ -1518,15 +1519,38 @@ void run_daemon_collector(Database *db) {
 // ============================================================================
 // SQL Query & CLI Filter Handler
 // ============================================================================
+typedef enum {
+    GROUP_BY_APP = 0,
+    GROUP_BY_DAY,
+    GROUP_BY_HOUR,
+    GROUP_BY_WEEK,
+    GROUP_BY_MONTH
+} GroupByMode;
+
+typedef enum {
+    CLEANUP_NONE = 0,
+    CLEANUP_ALL,
+    CLEANUP_KEEP_DAYS,
+    CLEANUP_KEEP_MONTHS,
+    CLEANUP_KEEP_RANGE
+} CleanupMode;
+
 typedef struct {
     bool time_filter_active;
     char time_clause[128];
     char time_description[128];
     unsigned long long min_bytes;
     bool sort_asc;
+    bool sort_specified;
+    GroupByMode group_by;
     bool run_daemon;
     bool record_snapshot;
-    bool clear_history;
+    CleanupMode cleanup_mode;
+    int cleanup_days;
+    int cleanup_months;
+    char cleanup_start[32];
+    char cleanup_end[32];
+    bool skip_confirm;
 } CliOptions;
 
 void print_help(const char *prog_name) {
@@ -1534,6 +1558,8 @@ void print_help(const char *prog_name) {
     printf("     NetMonitor - Accurate Packet-Captured Network Usage Monitor (CLI)                             \n");
     printf("===================================================================================================\n");
     printf("Usage: %s [OPTIONS]\n\n", prog_name);
+    printf("Grouping & Aggregation Options:\n");
+    printf("  -g, --group-by <MODE>       Group usage by: app (default), day, hour, week, month\n\n");
     printf("Time Filtering Options (Executed in SQL):\n");
     printf("  --last-minute [N]           Show usage from last N minutes (default N=1)\n");
     printf("  --last-hour [N]             Show usage from last N hours   (default N=1)\n");
@@ -1544,19 +1570,24 @@ void print_help(const char *prog_name) {
     printf("Size Filtering & Sorting (Executed in SQL):\n");
     printf("      --min <SIZE>            Filter apps with traffic >= size (e.g., 200M, 1G, 500K)\n");
     printf("  -s, --sort <asc|desc>       Sort results by total consumption (default: desc)\n\n");
+    printf("Database Retention & Cleanup (with Confirmation):\n");
+    printf("      --clear, --reset        Purge ALL historical records from database (complete reset)\n");
+    printf("      --keep-days <N>         Keep only the last N days (delete older records)\n");
+    printf("      --keep-months <N>       Keep only the last N months (delete older records)\n");
+    printf("      --keep-range <S> <E>    Keep records between START and END dates (YYYY-MM-DD)\n");
+    printf("                              and delete all records outside this range\n");
+    printf("  -y, --yes, --force          Skip interactive confirmation prompt\n\n");
     printf("Network Classification Options:\n");
     printf("      --cgnat-local           Treat CGNAT (100.64.0.0/10) as local LAN traffic (e.g. Tailscale)\n\n");
-    printf("Database Management:\n");
-    printf("      --clear, --reset        Clear / reset all historical records from database\n\n");
     printf("Daemon & Execution Modes:\n");
     printf("  -D, --daemon                Run as background daemon service (logs to syslog)\n");
     printf("  -h, --help                  Display this help message and exit\n\n");
     printf("Examples:\n");
-    printf("  %s --last-minute 30\n", prog_name);
-    printf("  %s --last-hour 9\n", prog_name);
-    printf("  %s --last-day 5 --sort desc\n", prog_name);
-    printf("  %s --last-week 4 --min 200M\n", prog_name);
-    printf("  %s --custom \"2026-09-24\" --sort asc\n", prog_name);
+    printf("  %s --group-by day\n", prog_name);
+    printf("  %s --group-by hour --last-day 1\n", prog_name);
+    printf("  %s --keep-days 10\n", prog_name);
+    printf("  %s --keep-months 1\n", prog_name);
+    printf("  %s --keep-range \"2026-10-01\" \"2026-10-06\"\n", prog_name);
     printf("  %s --clear\n", prog_name);
     printf("===================================================================================================\n");
 }
@@ -1574,12 +1605,50 @@ void query_database(Database *database, const CliOptions *opts) {
         snprintf(having_clause, sizeof(having_clause), "HAVING total_bytes >= %llu", opts->min_bytes);
     }
 
-    const char *order_dir = opts->sort_asc ? "ASC" : "DESC";
+    const char *entity_expr = "app_name";
+    const char *header_title = "APPLICATION";
+    const char *default_order = "total_bytes DESC";
+
+    switch (opts->group_by) {
+        case GROUP_BY_DAY:
+            entity_expr = "strftime('%Y-%m-%d', timestamp)";
+            header_title = "DATE / DAY";
+            default_order = "entity_name DESC";
+            break;
+        case GROUP_BY_HOUR:
+            entity_expr = "strftime('%Y-%m-%d %H:00', timestamp)";
+            header_title = "HOUR PERIOD";
+            default_order = "entity_name DESC";
+            break;
+        case GROUP_BY_WEEK:
+            entity_expr = "strftime('%Y-W%W', timestamp)";
+            header_title = "WEEK";
+            default_order = "entity_name DESC";
+            break;
+        case GROUP_BY_MONTH:
+            entity_expr = "strftime('%Y-%m', timestamp)";
+            header_title = "MONTH";
+            default_order = "entity_name DESC";
+            break;
+        case GROUP_BY_APP:
+        default:
+            entity_expr = "app_name";
+            header_title = "APPLICATION";
+            default_order = "total_bytes DESC, app_name ASC";
+            break;
+    }
+
+    char order_by_clause[128];
+    if (opts->sort_specified) {
+        snprintf(order_by_clause, sizeof(order_by_clause), "total_bytes %s", opts->sort_asc ? "ASC" : "DESC");
+    } else {
+        snprintf(order_by_clause, sizeof(order_by_clause), "%s", default_order);
+    }
 
     // Conditional SQL aggregation cleanly separates WAN and LAN columns in a single query
     snprintf(sql,
              sizeof(sql),
-             "SELECT app_name, "
+             "SELECT %s AS entity_name, "
              "       SUM(CASE WHEN is_local = 0 THEN bytes_received ELSE 0 END) AS wan_download, "
              "       SUM(CASE WHEN is_local = 0 THEN bytes_sent ELSE 0 END) AS wan_upload, "
              "       SUM(CASE WHEN is_local = 1 THEN bytes_received ELSE 0 END) AS lan_download, "
@@ -1589,10 +1658,10 @@ void query_database(Database *database, const CliOptions *opts) {
              "       MAX(timestamp) AS last_seen "
              "FROM network_usage "
              "%s "
-             "GROUP BY app_name "
+             "GROUP BY entity_name "
              "%s "
-             "ORDER BY total_bytes %s, app_name ASC;",
-             where_clause, having_clause, order_dir);
+             "ORDER BY %s;",
+             entity_expr, where_clause, having_clause, order_by_clause);
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(database->db, sql, -1, &stmt, NULL);
@@ -1601,21 +1670,22 @@ void query_database(Database *database, const CliOptions *opts) {
         return;
     }
 
-    printf("\n=============================================================================================================================\n");
-    printf("                                              DATABASE QUERY RESULTS                                                         \n");
-    printf("=============================================================================================================================\n");
+    printf("\n=====================================================================================================================================================\n");
+    printf("                                              DATABASE QUERY RESULTS                                                                                 \n");
+    printf("=====================================================================================================================================================\n");
     printf(" Database: %s\n", database->db_path);
+    printf(" Group By: %s\n", header_title);
     printf(" Filter  : %s\n", opts->time_filter_active ? opts->time_description : "All Recorded Time");
     if (opts->min_bytes > 0) {
         char min_str[32];
         format_bytes(opts->min_bytes, min_str, sizeof(min_str));
         printf(" Min Size: >= %s\n", min_str);
     }
-    printf(" Sort    : Total Bytes %s\n", order_dir);
-    printf("-----------------------------------------------------------------------------------------------------------------------------\n");
-    printf("%-20s %-15s %-15s %-15s %-15s %-15s %-9s %-19s\n",
-           "APPLICATION", "WAN DOWNLOAD", "WAN UPLOAD", "LAN DOWNLOAD", "LAN UPLOAD", "TOTAL USAGE", "SAMPLES", "LAST SEEN");
-    printf("-----------------------------------------------------------------------------------------------------------------------------\n");
+    printf(" Sort    : %s\n", order_by_clause);
+    printf("-----------------------------------------------------------------------------------------------------------------------------------------------------\n");
+    printf("%-20s %-13s %-12s %-12s %-13s %-12s %-12s %-13s %-9s %-19s\n",
+           header_title, "TOTAL WAN", "WAN RX", "WAN TX", "TOTAL LAN", "LAN RX", "LAN TX", "TOTAL USAGE", "SAMPLES", "LAST SEEN");
+    printf("-----------------------------------------------------------------------------------------------------------------------------------------------------\n");
 
     int row_count = 0;
     unsigned long long grand_wan_down = 0;
@@ -1625,7 +1695,7 @@ void query_database(Database *database, const CliOptions *opts) {
     unsigned long long grand_total = 0;
 
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        const unsigned char *app = sqlite3_column_text(stmt, 0);
+        const unsigned char *entity = sqlite3_column_text(stmt, 0);
         unsigned long long wan_down = (unsigned long long)sqlite3_column_int64(stmt, 1);
         unsigned long long wan_up   = (unsigned long long)sqlite3_column_int64(stmt, 2);
         unsigned long long lan_down = (unsigned long long)sqlite3_column_int64(stmt, 3);
@@ -1634,20 +1704,27 @@ void query_database(Database *database, const CliOptions *opts) {
         int samples = sqlite3_column_int(stmt, 6);
         const unsigned char *last_seen = sqlite3_column_text(stmt, 7);
 
-        char wan_down_str[32], wan_up_str[32];
-        char lan_down_str[32], lan_up_str[32];
+        unsigned long long wan_tot = wan_down + wan_up;
+        unsigned long long lan_tot = lan_down + lan_up;
+
+        char wan_tot_str[32], wan_down_str[32], wan_up_str[32];
+        char lan_tot_str[32], lan_down_str[32], lan_up_str[32];
         char total_str[32];
 
+        format_bytes(wan_tot, wan_tot_str, sizeof(wan_tot_str));
         format_bytes(wan_down, wan_down_str, sizeof(wan_down_str));
         format_bytes(wan_up, wan_up_str, sizeof(wan_up_str));
+        format_bytes(lan_tot, lan_tot_str, sizeof(lan_tot_str));
         format_bytes(lan_down, lan_down_str, sizeof(lan_down_str));
         format_bytes(lan_up, lan_up_str, sizeof(lan_up_str));
         format_bytes(total, total_str, sizeof(total_str));
 
-        printf("%-20s %-15s %-15s %-15s %-15s %-15s %-9d %-19s\n",
-               app ? (const char *)app : "[unknown]",
+        printf("%-20s %-13s %-12s %-12s %-13s %-12s %-12s %-13s %-9d %-19s\n",
+               entity ? (const char *)entity : "[unknown]",
+               wan_tot_str,
                wan_down_str,
                wan_up_str,
+               lan_tot_str,
                lan_down_str,
                lan_up_str,
                total_str,
@@ -1665,21 +1742,24 @@ void query_database(Database *database, const CliOptions *opts) {
 
     if (row_count == 0) {
         printf("  No matching records found in database for the given criteria.\n");
-        printf("=============================================================================================================================\n\n");
+        printf("=====================================================================================================================================================\n\n");
         return;
     }
 
-    printf("-----------------------------------------------------------------------------------------------------------------------------\n");
-    char g_wdown_str[32], g_wup_str[32], g_ldown_str[32], g_lup_str[32], g_tot_str[32];
+    printf("-----------------------------------------------------------------------------------------------------------------------------------------------------\n");
+    char g_wtot_str[32], g_wdown_str[32], g_wup_str[32];
+    char g_ltot_str[32], g_ldown_str[32], g_lup_str[32], g_tot_str[32];
+    format_bytes(grand_wan_down + grand_wan_up, g_wtot_str, sizeof(g_wtot_str));
     format_bytes(grand_wan_down, g_wdown_str, sizeof(g_wdown_str));
     format_bytes(grand_wan_up, g_wup_str, sizeof(g_wup_str));
+    format_bytes(grand_lan_down + grand_lan_up, g_ltot_str, sizeof(g_ltot_str));
     format_bytes(grand_lan_down, g_ldown_str, sizeof(g_ldown_str));
     format_bytes(grand_lan_up, g_lup_str, sizeof(g_lup_str));
     format_bytes(grand_total, g_tot_str, sizeof(g_tot_str));
 
-    printf("%-20s %-15s %-15s %-15s %-15s %-15s Total Apps: %d\n",
-           "TOTAL AGGREGATED", g_wdown_str, g_wup_str, g_ldown_str, g_lup_str, g_tot_str, row_count);
-    printf("-----------------------------------------------------------------------------------------------------------------------------\n");
+    printf("%-20s %-13s %-12s %-12s %-13s %-12s %-12s %-13s Total Items: %d\n",
+           "TOTAL AGGREGATED", g_wtot_str, g_wdown_str, g_wup_str, g_ltot_str, g_ldown_str, g_lup_str, g_tot_str, row_count);
+    printf("-----------------------------------------------------------------------------------------------------------------------------------------------------\n");
 
     unsigned long long wan_tot = grand_wan_down + grand_wan_up;
     unsigned long long lan_tot = grand_lan_down + grand_lan_up;
@@ -1692,7 +1772,113 @@ void query_database(Database *database, const CliOptions *opts) {
     printf("  🏠 Local / LAN    (Network Sharing): %-10s (Download: %-9s | Upload: %-9s)\n",
            lan_tot_str, g_ldown_str, g_lup_str);
 
-    printf("=============================================================================================================================\n\n");
+    printf("=====================================================================================================================================================\n\n");
+}
+
+bool purge_database_records(Database *database, const CliOptions *opts) {
+    if (!database->db) return false;
+
+    if (access(database->db_path, W_OK) != 0) {
+        fprintf(stderr, "\n[ERROR] Cannot modify database: Write permission denied on '%s'.\n", database->db_path);
+        fprintf(stderr, "[HINT] The database is owned by root. Please run with sudo:\n");
+        fprintf(stderr, "       sudo netmon ...\n\n");
+        return false;
+    }
+
+    char delete_sql[512] = "";
+    char count_del_sql[512] = "";
+    char desc[256] = "";
+
+    if (opts->cleanup_mode == CLEANUP_ALL) {
+        snprintf(delete_sql, sizeof(delete_sql), "DELETE FROM network_usage; VACUUM;");
+        snprintf(count_del_sql, sizeof(count_del_sql), "SELECT COUNT(*) FROM network_usage;");
+        snprintf(desc, sizeof(desc), "Purge ALL recorded history (complete reset)");
+    } else if (opts->cleanup_mode == CLEANUP_KEEP_DAYS) {
+        snprintf(delete_sql, sizeof(delete_sql),
+                 "DELETE FROM network_usage WHERE timestamp < datetime('now', '-%d days', 'localtime'); VACUUM;",
+                 opts->cleanup_days);
+        snprintf(count_del_sql, sizeof(count_del_sql),
+                 "SELECT COUNT(*) FROM network_usage WHERE timestamp < datetime('now', '-%d days', 'localtime');",
+                 opts->cleanup_days);
+        snprintf(desc, sizeof(desc), "Keep last %d days (purge records older than %d days)",
+                 opts->cleanup_days, opts->cleanup_days);
+    } else if (opts->cleanup_mode == CLEANUP_KEEP_MONTHS) {
+        snprintf(delete_sql, sizeof(delete_sql),
+                 "DELETE FROM network_usage WHERE timestamp < datetime('now', '-%d months', 'localtime'); VACUUM;",
+                 opts->cleanup_months);
+        snprintf(count_del_sql, sizeof(count_del_sql),
+                 "SELECT COUNT(*) FROM network_usage WHERE timestamp < datetime('now', '-%d months', 'localtime');",
+                 opts->cleanup_months);
+        snprintf(desc, sizeof(desc), "Keep last %d month(s) (purge records older than %d months)",
+                 opts->cleanup_months, opts->cleanup_months);
+    } else if (opts->cleanup_mode == CLEANUP_KEEP_RANGE) {
+        snprintf(delete_sql, sizeof(delete_sql),
+                 "DELETE FROM network_usage WHERE date(timestamp) < date('%s') OR date(timestamp) > date('%s'); VACUUM;",
+                 opts->cleanup_start, opts->cleanup_end);
+        snprintf(count_del_sql, sizeof(count_del_sql),
+                 "SELECT COUNT(*) FROM network_usage WHERE date(timestamp) < date('%s') OR date(timestamp) > date('%s');",
+                 opts->cleanup_start, opts->cleanup_end);
+        snprintf(desc, sizeof(desc), "Keep records between %s and %s (purge all outside range)",
+                 opts->cleanup_start, opts->cleanup_end);
+    } else {
+        return false;
+    }
+
+    long long total_records = 0;
+    long long to_delete = 0;
+    sqlite3_stmt *stmt = NULL;
+
+    if (sqlite3_prepare_v2(database->db, "SELECT COUNT(*) FROM network_usage;", -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            total_records = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    if (sqlite3_prepare_v2(database->db, count_del_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            to_delete = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    long long to_keep = total_records - to_delete;
+    if (to_keep < 0) to_keep = 0;
+
+    printf("\n===================================================================================================\n");
+    printf("                              ⚠️  DATABASE RETENTION & PURGE WARNING                               \n");
+    printf("===================================================================================================\n");
+    printf(" Target Database   : %s\n", database->db_path);
+    printf(" Maintenance Plan  : %s\n", desc);
+    printf(" Total Records     : %lld\n", total_records);
+    printf(" Records to DELETE : \033[1;31m%lld\033[0m\n", to_delete);
+    printf(" Records to KEEP   : \033[1;32m%lld\033[0m\n", to_keep);
+    printf(" WARNING           : This action will permanently delete records and CANNOT be undone!\n");
+    printf("===================================================================================================\n");
+
+    if (!opts->skip_confirm) {
+        printf(" Are you sure you want to proceed with permanent deletion? [y/N]: ");
+        fflush(stdout);
+
+        char answer[64] = "";
+        if (fgets(answer, sizeof(answer), stdin) == NULL ||
+            (answer[0] != 'y' && answer[0] != 'Y')) {
+            printf("\n[*] Operation cancelled by user. No database records were modified.\n\n");
+            return false;
+        }
+    }
+
+    char *err_msg = NULL;
+    int rc = sqlite3_exec(database->db, delete_sql, NULL, NULL, &err_msg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "\n[ERROR] Failed to execute database purge: %s\n\n", err_msg ? err_msg : "Unknown error");
+        sqlite3_free(err_msg);
+        return false;
+    }
+
+    printf("\n[✓] Successfully executed: %s\n", desc);
+    printf("    Purged %lld records. Database successfully compacted with VACUUM.\n\n", to_delete);
+    return true;
 }
 
 int get_optional_numeric_arg(int argc, char *argv[]) {
@@ -1723,9 +1909,16 @@ int main(int argc, char *argv[]) {
         .time_description = "",
         .min_bytes = 0,
         .sort_asc = false,
+        .sort_specified = false,
+        .group_by = GROUP_BY_APP,
         .run_daemon = false,
         .record_snapshot = false,
-        .clear_history = false
+        .cleanup_mode = CLEANUP_NONE,
+        .cleanup_days = 0,
+        .cleanup_months = 0,
+        .cleanup_start = "",
+        .cleanup_end = "",
+        .skip_confirm = false
     };
 
     enum {
@@ -1733,7 +1926,10 @@ int main(int argc, char *argv[]) {
         OPT_LAST_HOUR,
         OPT_MIN_SIZE,
         OPT_CLEAR,
-        OPT_CGNAT_LOCAL
+        OPT_CGNAT_LOCAL,
+        OPT_KEEP_DAYS,
+        OPT_KEEP_MONTHS,
+        OPT_KEEP_RANGE
     };
 
     static struct option long_options[] = {
@@ -1746,6 +1942,12 @@ int main(int argc, char *argv[]) {
         {"custom",      required_argument, 0, 'c'},
         {"min",         required_argument, 0, OPT_MIN_SIZE},
         {"sort",        required_argument, 0, 's'},
+        {"group-by",    required_argument, 0, 'g'},
+        {"keep-days",   required_argument, 0, OPT_KEEP_DAYS},
+        {"keep-months", required_argument, 0, OPT_KEEP_MONTHS},
+        {"keep-range",  required_argument, 0, OPT_KEEP_RANGE},
+        {"yes",         no_argument,       0, 'y'},
+        {"force",       no_argument,       0, 'y'},
         {"cgnat-local", no_argument,       0, OPT_CGNAT_LOCAL},
         {"clear",       no_argument,       0, OPT_CLEAR},
         {"reset",       no_argument,       0, OPT_CLEAR},
@@ -1756,7 +1958,7 @@ int main(int argc, char *argv[]) {
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "clear") == 0 || strcmp(argv[i], "reset") == 0) {
-            opts.clear_history = true;
+            opts.cleanup_mode = CLEANUP_ALL;
             break;
         }
     }
@@ -1764,8 +1966,64 @@ int main(int argc, char *argv[]) {
     int opt;
     int option_index = 0;
 
-    while ((opt = getopt_long(argc, argv, "d::w::m::c:s:Dh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d::w::m::c:s:g:yDh", long_options, &option_index)) != -1) {
         switch (opt) {
+            case 'g':
+                if (optarg) {
+                    if (strcasecmp(optarg, "day") == 0 || strcasecmp(optarg, "daily") == 0) {
+                        opts.group_by = GROUP_BY_DAY;
+                    } else if (strcasecmp(optarg, "hour") == 0 || strcasecmp(optarg, "hourly") == 0) {
+                        opts.group_by = GROUP_BY_HOUR;
+                    } else if (strcasecmp(optarg, "week") == 0 || strcasecmp(optarg, "weekly") == 0) {
+                        opts.group_by = GROUP_BY_WEEK;
+                    } else if (strcasecmp(optarg, "month") == 0 || strcasecmp(optarg, "monthly") == 0) {
+                        opts.group_by = GROUP_BY_MONTH;
+                    } else if (strcasecmp(optarg, "app") == 0 || strcasecmp(optarg, "application") == 0) {
+                        opts.group_by = GROUP_BY_APP;
+                    } else {
+                        fprintf(stderr, "Unknown group-by mode '%s'. Choose from: app, day, hour, week, month\n", optarg);
+                        return 1;
+                    }
+                }
+                break;
+
+            case OPT_KEEP_DAYS:
+                opts.cleanup_mode = CLEANUP_KEEP_DAYS;
+                opts.cleanup_days = atoi(optarg);
+                if (opts.cleanup_days <= 0) opts.cleanup_days = 1;
+                break;
+
+            case OPT_KEEP_MONTHS:
+                opts.cleanup_mode = CLEANUP_KEEP_MONTHS;
+                opts.cleanup_months = atoi(optarg);
+                if (opts.cleanup_months <= 0) opts.cleanup_months = 1;
+                break;
+
+            case OPT_KEEP_RANGE: {
+                opts.cleanup_mode = CLEANUP_KEEP_RANGE;
+                char *comma = strchr(optarg, ',');
+                if (!comma) comma = strchr(optarg, ':');
+                if (comma) {
+                    *comma = '\0';
+                    strncpy(opts.cleanup_start, optarg, sizeof(opts.cleanup_start) - 1);
+                    strncpy(opts.cleanup_end, comma + 1, sizeof(opts.cleanup_end) - 1);
+                } else {
+                    strncpy(opts.cleanup_start, optarg, sizeof(opts.cleanup_start) - 1);
+                    if (optind < argc && argv[optind] && argv[optind][0] != '-') {
+                        strncpy(opts.cleanup_end, argv[optind++], sizeof(opts.cleanup_end) - 1);
+                    } else {
+                        time_t t = time(NULL);
+                        struct tm *tm_info = localtime(&t);
+                        strftime(opts.cleanup_end, sizeof(opts.cleanup_end), "%Y-%m-%d", tm_info);
+                    }
+                }
+                break;
+            }
+
+            case 'y':
+                opts.skip_confirm = true;
+                break;
+
             case OPT_LAST_MINUTE: {
                 int n = get_optional_numeric_arg(argc, argv);
                 opts.time_filter_active = true;
@@ -1823,6 +2081,7 @@ int main(int argc, char *argv[]) {
 
             case 's':
                 if (optarg) {
+                    opts.sort_specified = true;
                     if (strcasecmp(optarg, "asc") == 0) {
                         opts.sort_asc = true;
                     } else if (strcasecmp(optarg, "desc") == 0) {
@@ -1839,7 +2098,7 @@ int main(int argc, char *argv[]) {
                 break;
 
             case OPT_CLEAR:
-                opts.clear_history = true;
+                opts.cleanup_mode = CLEANUP_ALL;
                 break;
 
             case 'D':
@@ -1856,12 +2115,12 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (opts.clear_history) {
+    if (opts.cleanup_mode != CLEANUP_NONE) {
         Database db = {0};
         if (!init_database(&db, true)) {
             return 1;
         }
-        clear_database(&db);
+        purge_database_records(&db, &opts);
         close_database(&db);
         return 0;
     }

@@ -15,3 +15,7 @@ netmon
 # Local vendor development libraries
 include/
 lib/
+
+# Python cache
+__pycache__/
+*.pyc
