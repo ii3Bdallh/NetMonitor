@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QLineEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QFrame, QFileDialog, QMessageBox,
     QDateEdit, QCheckBox, QStackedWidget, QScrollArea, QMenu, QToolButton,
-    QButtonGroup, QDialog, QRadioButton, QGroupBox
+    QButtonGroup, QDialog, QRadioButton, QGroupBox, QSpinBox
 )
 
 DEFAULT_SYSTEM_DB = "/var/lib/netmon/usage.db"
@@ -1126,7 +1126,7 @@ class DbQueryWorker(QThread):
         """
 
         # 3. Days Summary for GlassWire Cards
-        days_sql = """
+        days_sql = f"""
             SELECT strftime('%Y-%m-%d', timestamp) AS day_val,
                    SUM(CASE WHEN is_local = 0 THEN bytes_received ELSE 0 END) AS w_down,
                    SUM(CASE WHEN is_local = 0 THEN bytes_sent ELSE 0 END) AS w_up,
@@ -1134,9 +1134,10 @@ class DbQueryWorker(QThread):
                    SUM(CASE WHEN is_local = 1 THEN bytes_sent ELSE 0 END) AS l_up,
                    SUM(bytes_sent + bytes_received) AS grand_total
             FROM network_usage
+            {self.time_clause}
             GROUP BY day_val
             ORDER BY day_val DESC
-            LIMIT 10;
+            LIMIT 15;
         """
 
         # 4. Hours Summary for GlassWire Cards
@@ -1242,7 +1243,7 @@ class DbQueryWorker(QThread):
             """
 
         # 7. Day-to-Apps Drilldown Query (always available for Daily Breakdown cards)
-        day_apps_sql = """
+        day_apps_sql = f"""
             SELECT strftime('%Y-%m-%d', timestamp) AS p_key,
                    app_name AS c_name,
                    SUM(CASE WHEN is_local = 0 THEN bytes_received ELSE 0 END) AS w_down,
@@ -1251,6 +1252,7 @@ class DbQueryWorker(QThread):
                    SUM(CASE WHEN is_local = 1 THEN bytes_sent ELSE 0 END) AS lan_up,
                    SUM(bytes_sent + bytes_received) AS total
             FROM network_usage
+            {self.time_clause}
             GROUP BY p_key, c_name
             ORDER BY p_key DESC, total DESC;
         """
@@ -1936,6 +1938,8 @@ class NetMonitorApp(QMainWindow):
         self.curr_rx_speed = 0
         self.curr_tx_speed = 0
 
+        self._syncing_time_filter = False
+
         self.init_ui()
         self.apply_theme()
 
@@ -1944,6 +1948,12 @@ class NetMonitorApp(QMainWindow):
         self.search_debounce.setSingleShot(True)
         self.search_debounce.setInterval(150)
         self.search_debounce.timeout.connect(self.apply_client_filters)
+
+        # Time filter debounce timer (300ms)
+        self.time_filter_debounce = QTimer(self)
+        self.time_filter_debounce.setSingleShot(True)
+        self.time_filter_debounce.setInterval(300)
+        self.time_filter_debounce.timeout.connect(self.trigger_refresh)
 
         # Auto-refresh timer
         self.refresh_timer = QTimer(self)
@@ -2045,12 +2055,16 @@ class NetMonitorApp(QMainWindow):
         # ---------------------------------------------------------
         toolbar_frame = QFrame()
         toolbar_frame.setObjectName("ToolbarFrame")
-        tb_layout = QHBoxLayout(toolbar_frame)
-        tb_layout.setContentsMargins(10, 6, 10, 6)
-        tb_layout.setSpacing(10)
+        tb_main_layout = QVBoxLayout(toolbar_frame)
+        tb_main_layout.setContentsMargins(10, 7, 10, 7)
+        tb_main_layout.setSpacing(6)
+
+        # ------------------ Row 1: Primary Controls ------------------
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
 
         # Group By Selector (Day, Hour, Week, Month, App)
-        tb_layout.addWidget(QLabel("🗂️ Group By:"))
+        row1.addWidget(QLabel("🗂️ Group By:"))
         self.group_by_combo = QComboBox()
         self.group_by_combo.addItems([
             "Application",
@@ -2060,12 +2074,46 @@ class NetMonitorApp(QMainWindow):
             "Month (Monthly Usage)"
         ])
         self.group_by_combo.currentIndexChanged.connect(self.on_group_by_changed)
-        tb_layout.addWidget(self.group_by_combo)
+        row1.addWidget(self.group_by_combo)
 
-        tb_layout.addSpacing(6)
+        row1.addSpacing(6)
 
-        # Time Filter
-        tb_layout.addWidget(QLabel("🕒 Time Filter:"))
+        # Minimum Size Filter
+        row1.addWidget(QLabel("📦 Min Size:"))
+        self.min_size_combo = QComboBox()
+        self.min_size_combo.addItems([
+            "All Sizes", "≥ 100 KB", "≥ 1 MB", "≥ 10 MB", "≥ 100 MB", "≥ 500 MB", "≥ 1 GB"
+        ])
+        self.min_size_combo.currentIndexChanged.connect(self.apply_client_filters)
+        row1.addWidget(self.min_size_combo)
+
+        row1.addSpacing(6)
+
+        # Search Bar
+        row1.addWidget(QLabel("🔍 Search:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Filter name...")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(lambda: self.search_debounce.start())
+        row1.addWidget(self.search_input, stretch=1)
+
+        # Export CSV Button
+        self.export_btn = QPushButton("💾 CSV")
+        self.export_btn.setToolTip("Export currently filtered usage data to CSV")
+        self.export_btn.clicked.connect(self.export_to_csv)
+        row1.addWidget(self.export_btn)
+
+        tb_main_layout.addLayout(row1)
+
+        # ------------------ Row 2: Comprehensive Time Filter Bar ------------------
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+
+        lbl_time = QLabel("🕒 Time Filter:")
+        lbl_time.setStyleSheet("font-weight: 700; color: #94a3b8;")
+        row2.addWidget(lbl_time)
+
+        # Presets dropdown
         self.time_combo = QComboBox()
         self.time_combo.addItems([
             "All Time",
@@ -2077,42 +2125,94 @@ class NetMonitorApp(QMainWindow):
             "Last 24 Hours (Today)",
             "Last 7 Days (Week)",
             "Last 30 Days (Month)",
-            "Custom Date..."
+            "Custom Duration",
+            "Specific Date..."
         ])
         self.time_combo.setCurrentText("All Time")
-        self.time_combo.currentIndexChanged.connect(self.on_time_filter_changed)
-        tb_layout.addWidget(self.time_combo)
+        self.time_combo.currentIndexChanged.connect(self.on_time_preset_changed)
+        row2.addWidget(self.time_combo)
 
-        # Custom Date Picker
+        # Container frame for the 5 duration boxes
+        time_boxes_frame = QFrame()
+        time_boxes_frame.setStyleSheet("""
+            QFrame {
+                background-color: #0b111e;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+            }
+        """)
+        tf_layout = QHBoxLayout(time_boxes_frame)
+        tf_layout.setContentsMargins(6, 2, 6, 2)
+        tf_layout.setSpacing(6)
+
+        def create_spin_field(name, max_val, tooltip):
+            lbl = QLabel(name)
+            lbl.setStyleSheet("color: #cbd5e1; font-size: 11px; font-weight: 600; border: none; background: transparent;")
+            spin = QSpinBox()
+            spin.setRange(0, max_val)
+            spin.setValue(0)
+            spin.setToolTip(tooltip)
+            spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            spin.setFixedWidth(56)
+            spin.setStyleSheet("""
+                QSpinBox {
+                    background-color: #161e2e;
+                    color: #38bdf8;
+                    border: 1px solid #28354b;
+                    border-radius: 4px;
+                    padding: 2px 4px;
+                    font-size: 12px;
+                    font-weight: bold;
+                }
+                QSpinBox:hover, QSpinBox:focus {
+                    border-color: #38bdf8;
+                    background-color: #1e293b;
+                }
+            """)
+            spin.valueChanged.connect(self.on_spin_duration_changed)
+            spin.lineEdit().returnPressed.connect(self.trigger_refresh)
+            tf_layout.addWidget(lbl)
+            tf_layout.addWidget(spin)
+            return spin
+
+        self.spin_months = create_spin_field("Months:", 120, "Filter by past months (each = 30 days)")
+        self.spin_weeks = create_spin_field("Weeks:", 520, "Filter by past weeks (each = 7 days)")
+        self.spin_days = create_spin_field("Days:", 3650, "Filter by past days (each = 24 hours)")
+        self.spin_hours = create_spin_field("Hours:", 87600, "Filter by past hours (each = 60 minutes)")
+        self.spin_minutes = create_spin_field("Minutes:", 5256000, "Filter by past minutes")
+
+        row2.addWidget(time_boxes_frame)
+
+        # Reset button
+        self.btn_reset_time = QPushButton("⟲ All Time")
+        self.btn_reset_time.setToolTip("Reset time filter to 0 (All Time)")
+        self.btn_reset_time.clicked.connect(self.on_reset_time_clicked)
+        row2.addWidget(self.btn_reset_time)
+
+        # Specific Date Picker
         self.custom_date_edit = QDateEdit()
         self.custom_date_edit.setCalendarPopup(True)
         self.custom_date_edit.setDate(QtCore.QDate.currentDate())
         self.custom_date_edit.setVisible(False)
         self.custom_date_edit.dateChanged.connect(self.trigger_refresh)
-        tb_layout.addWidget(self.custom_date_edit)
+        row2.addWidget(self.custom_date_edit)
 
-        # Minimum Size Filter
-        tb_layout.addWidget(QLabel("📦 Min Size:"))
-        self.min_size_combo = QComboBox()
-        self.min_size_combo.addItems([
-            "All Sizes", "≥ 100 KB", "≥ 1 MB", "≥ 10 MB", "≥ 100 MB", "≥ 500 MB", "≥ 1 GB"
-        ])
-        self.min_size_combo.currentIndexChanged.connect(self.apply_client_filters)
-        tb_layout.addWidget(self.min_size_combo)
+        # Duration Summary Badge
+        self.lbl_time_summary = QLabel("🌐 All Time")
+        self.lbl_time_summary.setStyleSheet("""
+            color: #94a3b8;
+            background-color: #0f172a;
+            border: 1px solid #1e293b;
+            border-radius: 4px;
+            padding: 3px 8px;
+            font-size: 11px;
+            font-weight: 700;
+        """)
+        row2.addWidget(self.lbl_time_summary)
 
-        # Search Bar
-        tb_layout.addWidget(QLabel("🔍 Search:"))
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Filter name...")
-        self.search_input.setClearButtonEnabled(True)
-        self.search_input.textChanged.connect(lambda: self.search_debounce.start())
-        tb_layout.addWidget(self.search_input)
+        row2.addStretch()
 
-        # Export CSV Button
-        self.export_btn = QPushButton("💾 CSV")
-        self.export_btn.clicked.connect(self.export_to_csv)
-        tb_layout.addWidget(self.export_btn)
-
+        tb_main_layout.addLayout(row2)
         main_layout.addWidget(toolbar_frame)
 
         # ---------------------------------------------------------
@@ -2340,15 +2440,23 @@ class NetMonitorApp(QMainWindow):
                 border: 1px solid #7f1d1d;
             }
             QPushButton#DangerBtn:hover { background-color: #5b1d2a; border-color: #991b1b; }
-            QComboBox, QLineEdit, QDateEdit {
+            QComboBox, QLineEdit, QDateEdit, QSpinBox {
                 background-color: #161e2e;
                 color: #f8fafc;
                 border: 1px solid #28354b;
                 border-radius: 6px;
-                padding: 4px 8px;
+                padding: 4px 6px;
                 font-size: 12px;
             }
-            QComboBox:hover, QLineEdit:hover, QDateEdit:hover { border-color: #38bdf8; }
+            QComboBox:hover, QLineEdit:hover, QDateEdit:hover, QSpinBox:hover, QSpinBox:focus { border-color: #38bdf8; }
+            QSpinBox::up-button, QSpinBox::down-button {
+                width: 13px;
+                background-color: #1e293b;
+                border: none;
+                border-radius: 2px;
+                margin: 1px;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover { background-color: #38bdf8; }
             QCheckBox { color: #94a3b8; font-size: 12px; }
             QCheckBox::indicator {
                 width: 15px; height: 15px; border-radius: 4px;
@@ -2423,33 +2531,172 @@ class NetMonitorApp(QMainWindow):
         sec = int(text.replace("s", ""))
         self.refresh_timer.setInterval(sec * 1000)
 
-    def on_time_filter_changed(self):
-        text = self.time_combo.currentText()
-        is_custom = (text == "Custom Date...")
-        self.custom_date_edit.setVisible(is_custom)
+    def get_filter_duration_seconds(self):
+        m = self.spin_months.value()
+        w = self.spin_weeks.value()
+        d = self.spin_days.value()
+        h = self.spin_hours.value()
+        mi = self.spin_minutes.value()
+
+        total_minutes = (m * 30 * 1440) + (w * 7 * 1440) + (d * 1440) + (h * 60) + mi
+        return total_minutes * 60
+
+    def on_time_preset_changed(self):
+        if self._syncing_time_filter:
+            return
+        preset = self.time_combo.currentText()
+        self._syncing_time_filter = True
+        try:
+            if preset == "Custom Duration":
+                self.custom_date_edit.setVisible(False)
+                return
+            elif preset == "Specific Date...":
+                self.custom_date_edit.setVisible(True)
+                self.spin_months.setValue(0)
+                self.spin_weeks.setValue(0)
+                self.spin_days.setValue(0)
+                self.spin_hours.setValue(0)
+                self.spin_minutes.setValue(0)
+            else:
+                self.custom_date_edit.setVisible(False)
+                m, w, d, h, mi = 0, 0, 0, 0, 0
+                if preset == "Last 5 Minutes":
+                    mi = 5
+                elif preset == "Last 15 Minutes":
+                    mi = 15
+                elif preset == "Last 30 Minutes":
+                    mi = 30
+                elif preset == "Last 1 Hour":
+                    h = 1
+                elif preset == "Last 6 Hours":
+                    h = 6
+                elif preset == "Last 24 Hours (Today)":
+                    d = 1
+                elif preset == "Last 7 Days (Week)":
+                    w = 1
+                elif preset == "Last 30 Days (Month)":
+                    m = 1
+                elif preset == "All Time":
+                    pass
+
+                self.spin_months.setValue(m)
+                self.spin_weeks.setValue(w)
+                self.spin_days.setValue(d)
+                self.spin_hours.setValue(h)
+                self.spin_minutes.setValue(mi)
+        finally:
+            self._syncing_time_filter = False
+
+        self._update_time_summary_label()
         self.trigger_refresh()
+
+    on_time_filter_changed = on_time_preset_changed
+
+    def on_spin_duration_changed(self):
+        if self._syncing_time_filter:
+            return
+        self._syncing_time_filter = True
+        try:
+            self.custom_date_edit.setVisible(False)
+            total_sec = self.get_filter_duration_seconds()
+            if total_sec == 0:
+                idx = self.time_combo.findText("All Time")
+                if idx >= 0:
+                    self.time_combo.setCurrentIndex(idx)
+            else:
+                idx = self.time_combo.findText("Custom Duration")
+                if idx >= 0:
+                    self.time_combo.setCurrentIndex(idx)
+        finally:
+            self._syncing_time_filter = False
+
+        self._update_time_summary_label()
+        self.time_filter_debounce.start()
+
+    def on_reset_time_clicked(self):
+        self._syncing_time_filter = True
+        try:
+            self.spin_months.setValue(0)
+            self.spin_weeks.setValue(0)
+            self.spin_days.setValue(0)
+            self.spin_hours.setValue(0)
+            self.spin_minutes.setValue(0)
+            self.custom_date_edit.setVisible(False)
+            idx = self.time_combo.findText("All Time")
+            if idx >= 0:
+                self.time_combo.setCurrentIndex(idx)
+        finally:
+            self._syncing_time_filter = False
+
+        self._update_time_summary_label()
+        self.trigger_refresh()
+
+    def _update_time_summary_label(self):
+        if self.time_combo.currentText() == "Specific Date...":
+            date_str = self.custom_date_edit.date().toString("yyyy-MM-dd")
+            self.lbl_time_summary.setText(f"📅 Day: {date_str}")
+            self.lbl_time_summary.setToolTip(f"Specific date filter: {date_str}")
+            self.lbl_time_summary.setStyleSheet("""
+                color: #f59e0b; background-color: #1c1917; border: 1px solid #78350f;
+                border-radius: 4px; padding: 3px 8px; font-size: 11px; font-weight: 700;
+            """)
+            return
+
+        m = self.spin_months.value()
+        w = self.spin_weeks.value()
+        d = self.spin_days.value()
+        h = self.spin_hours.value()
+        mi = self.spin_minutes.value()
+
+        total_minutes = (m * 30 * 1440) + (w * 7 * 1440) + (d * 1440) + (h * 60) + mi
+        if total_minutes == 0:
+            self.lbl_time_summary.setText("🌐 All Time")
+            self.lbl_time_summary.setToolTip("Showing all recorded network history")
+            self.lbl_time_summary.setStyleSheet("""
+                color: #94a3b8; background-color: #0f172a; border: 1px solid #1e293b;
+                border-radius: 4px; padding: 3px 8px; font-size: 11px; font-weight: 600;
+            """)
+            return
+
+        total_days = total_minutes // 1440
+        rem_min_in_day = total_minutes % 1440
+        rem_hours = rem_min_in_day // 60
+        final_mins = rem_min_in_day % 60
+        total_hours = total_minutes // 60
+
+        if total_days > 0 and rem_hours == 0 and final_mins == 0:
+            text = f"📅 Last {total_days} Day{'s' if total_days != 1 else ''}"
+        elif total_hours > 0 and final_mins == 0:
+            text = f"🕒 Last {total_hours} Hour{'s' if total_hours != 1 else ''}"
+        elif total_hours > 0 and final_mins > 0:
+            text = f"🕒 Last {total_hours}h {final_mins}m"
+        else:
+            text = f"🕒 Last {final_mins} Minute{'s' if final_mins != 1 else ''}"
+
+        detailed_parts = []
+        if m > 0: detailed_parts.append(f"{m} mo")
+        if w > 0: detailed_parts.append(f"{w} wk")
+        if d > 0: detailed_parts.append(f"{d} d")
+        if h > 0: detailed_parts.append(f"{h} hr")
+        if mi > 0: detailed_parts.append(f"{mi} min")
+        detail_str = " + ".join(detailed_parts)
+
+        self.lbl_time_summary.setText(text)
+        self.lbl_time_summary.setToolTip(f"Active Filter: {detail_str} (= {total_minutes:,} minutes total)")
+        self.lbl_time_summary.setStyleSheet("""
+            color: #38bdf8; background-color: #0c4a6e; border: 1px solid #0284c7;
+            border-radius: 4px; padding: 3px 8px; font-size: 11px; font-weight: 700;
+        """)
 
     def get_time_sql_clause(self):
         filter_text = self.time_combo.currentText()
-        if filter_text == "Last 5 Minutes":
-            return "WHERE timestamp >= datetime('now', '-5 minutes', 'localtime')"
-        elif filter_text == "Last 15 Minutes":
-            return "WHERE timestamp >= datetime('now', '-15 minutes', 'localtime')"
-        elif filter_text == "Last 30 Minutes":
-            return "WHERE timestamp >= datetime('now', '-30 minutes', 'localtime')"
-        elif filter_text == "Last 1 Hour":
-            return "WHERE timestamp >= datetime('now', '-1 hours', 'localtime')"
-        elif filter_text == "Last 6 Hours":
-            return "WHERE timestamp >= datetime('now', '-6 hours', 'localtime')"
-        elif filter_text == "Last 24 Hours (Today)":
-            return "WHERE timestamp >= datetime('now', '-1 days', 'localtime')"
-        elif filter_text == "Last 7 Days (Week)":
-            return "WHERE timestamp >= datetime('now', '-7 days', 'localtime')"
-        elif filter_text == "Last 30 Days (Month)":
-            return "WHERE timestamp >= datetime('now', '-30 days', 'localtime')"
-        elif filter_text == "Custom Date...":
+        if filter_text == "Specific Date...":
             date_str = self.custom_date_edit.date().toString("yyyy-MM-dd")
             return f"WHERE date(timestamp) = date('{date_str}')"
+
+        sec = self.get_filter_duration_seconds()
+        if sec > 0:
+            return f"WHERE timestamp >= datetime('now', '-{sec} seconds', 'localtime')"
         return ""
 
     def trigger_refresh(self):
